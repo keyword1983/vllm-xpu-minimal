@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-xpu-minimal"
+version = "0.0.1"
+description = "Minimal fake vLLM hardware plugin for onboarding"
+requires-python = ">=3.10"
+dependencies = ["vllm>=0.11.0"]
+
+[project.entry-points."vllm.platform_plugins"]
+xpu_fake = "vllm_xpu_minimal:register"
+
+[project.entry-points."vllm.general_plugins"]
+xpu_fake_ops = "vllm_xpu_minimal:register_ops"
+
+[tool.setuptools.packages.find]
+include = ["vllm_xpu_minimal*"]

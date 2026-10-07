@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# venv（誤建在 path/to/venv. 的教學環境）
+path/
+
+# IDE
+.idea/
+.vscode/
+
+# 編譯快取
+.cache/
