@@ -12,85 +12,105 @@ vLLM 把 attention 抽成三件組：
    rbln_triton_ops kernel、SWA ring buffer）
 - 上游 CPU 版:   vllm/v1/attention/backends/cpu_attn.py（TorchSDPABackend）
 
-★ 版本漂移教訓（坑 6）：0.11.0 wheel 的 cpu_attn.py 有 TorchSDPABackend，
-  你環境的 vLLM 版本沒有（可能改名或移除）。教學插件改用
-  FlexAttentionBackend——它是純 torch 實作（torch.nn.attention.flex_attention），
-  不依賴任何 CUDA extension，且官方文件明說它支援所有 head size。
-  注意：FlexAttention 的 KV 寫入走 torch.ops._C_cache_ops.
-  reshape_and_cache_flash（CUDA op）——CPU 上會炸，所以我們 override
-  Impl 的 forward，改用純 torch 的 cache 寫入。
+★ 坑 9 的教訓：先查上游有沒有現成的同類後端！
+版本漂移（坑 6）後改繼承 FlexAttentionBackend，但它的 KV 寫入走
+CUDA op（torch.ops._C_cache_ops.reshape_and_cache_flash），
+要自己 override。改回 CPU 後端原生搭配的 TorchSDPABackend——
+但注意：你環境的 vLLM 版本可能沒有這個類別（坑 6 的教訓），
+所以這裡用防禦式 import：有就用、沒有就 fallback 到 FlexAttention
++ 純 torch KV 寫入 override。
 """
 import logging
 
 import torch
-from vllm.v1.attention.backends.flex_attention import (
-    FlexAttentionBackend, FlexAttentionImpl)
 
 logger = logging.getLogger(__name__)
 
+# 防禦式 import（坑 6 教訓：上游 backend 類別不是穩定介面）
+try:
+    from vllm.v1.attention.backends.cpu_attn import TorchSDPABackend
 
-class XPUFakeAttentionImpl(FlexAttentionImpl):
-    """Override KV cache 寫入：FlexAttention 用 CUDA op
-    （torch.ops._C_cache_ops.reshape_and_cache_flash），CPU 上不存在。
-    改用純 torch 的 scatter 寫入（教學用，效能不追求）。"""
+    _HAS_TORCH_SDPA = True
+except ImportError:
+    _HAS_TORCH_SDPA = False
 
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                output=None, output_scale=None, output_block_scale=None):
-        # attn_metadata is None → profiling run，直接回傳
-        if attn_metadata is None:
-            return output
+if _HAS_TORCH_SDPA:
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
+    class XPUFakeAttentionBackend(TorchSDPABackend):
+        """繼承 CPU 的 SDPA backend（純 torch，與 CPUModelRunner 原生搭配）。
 
-        # KV cache 寫入：純 torch 版的 reshape_and_cache_flash
-        # kv_cache shape: (2, num_blocks, block_size, num_kv_heads, head_size)
-        if self.kv_sharing_target_layer_name is None:
-            key_cache, value_cache = kv_cache.unbind(0)
-            slot_mapping = attn_metadata.slot_mapping
-            # slot_mapping: (num_tokens,) — 每個 token 的 (block*block_size+offset)
-            # 展平 cache 為 (num_blocks*block_size, num_kv_heads, head_size)
-            flat_k = key_cache.view(-1, key_cache.shape[-2], key_cache.shape[-1])
-            flat_v = value_cache.view(-1, value_cache.shape[-2],
-                                      value_cache.shape[-1])
-            valid = slot_mapping >= 0
-            slots = slot_mapping[valid]
-            flat_k[slots] = key[valid]
-            flat_v[slots] = value[valid]
+        【真插件必寫的三個靜態方法】（這裡繼承上游，僅註解示範）：
 
-        # 交回父類做 attention 計算（flex_attention 本身是純 torch）
-        return super().forward(layer, query, key, value, kv_cache,
-                               attn_metadata, output, output_scale,
-                               output_block_scale)
-
-
-class XPUFakeAttentionBackend(FlexAttentionBackend):
-    """繼承 FlexAttention backend（純 torch，無 CUDA 依賴）。
-
-    【真插件必寫的三個靜態方法】（這裡繼承上游，僅註解示範）：
-
-    @staticmethod
-    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size,
-                           cache_dtype_str="auto"):
-        # TPU: (num_blocks, block_size, num_kv_heads*2, padded_head_size)
-        #      head_size 對齊 128（TPU_HEAD_SIZE_ALIGNMENT）
-        # RBLN: [2, num_kv_heads, 1, block_size, head_size]
-        # Flex: (2, num_blocks, block_size, num_kv_heads, head_size)
-        ...
-
-    @staticmethod
-    def get_page_size(vllm_config):
-        # TPU 獨有：page size 由 SMEM/SREG 限制反推
-        # （max_model_len > 8192 → 16，否則 next_pow2(max_len)//16 夾在 [16,256]）
-        ...
-
-    class MetadataBuilder(AttentionMetadataBuilder):
-        def build(self, common_prefix_len, common_attn_metadata, ...):
-            # 每步把 CommonAttentionMetadata 轉成 backend 自己的 metadata
-            # TPU：dummy shell（真 metadata 由編譯管線動態建）
-            # RBLN：host 建 mask、stage 到 persistent device buffer
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, num_kv_heads,
+                               head_size, cache_dtype_str="auto"):
+            # TPU: (num_blocks, block_size, num_kv_heads*2, padded_head_size)
+            #      head_size 對齊 128（TPU_HEAD_SIZE_ALIGNMENT）
+            # RBLN: [2, num_kv_heads, 1, block_size, head_size]
+            # GPU:  (2, num_blocks, block_size * num_kv_heads * head_size)
             ...
-    """
 
-    @staticmethod
-    def get_impl_cls():
-        return XPUFakeAttentionImpl
+        @staticmethod
+        def get_page_size(vllm_config):
+            # TPU 獨有：page size 由 SMEM/SREG 限制反推
+            # （max_model_len > 8192 → 16，否則 next_pow2(max_len)//16
+            #   夾在 [16,256]）
+            ...
+
+        class MetadataBuilder(AttentionMetadataBuilder):
+            def build(self, common_prefix_len, common_attn_metadata, ...):
+                # 每步把 CommonAttentionMetadata 轉成 backend 自己的 metadata
+                # TPU：dummy shell（真 metadata 由編譯管線動態建）
+                # RBLN：host 建 mask、stage 到 persistent device buffer
+                ...
+        """
+
+        @classmethod
+        def get_supported_dtypes(cls) -> list:
+            return [torch.float16, torch.bfloat16, torch.float32]
+
+else:
+    # Fallback：FlexAttention（純 torch）+ 純 torch KV 寫入 override
+    from vllm.v1.attention.backends.flex_attention import (
+        FlexAttentionBackend, FlexAttentionImpl)
+
+    class XPUFakeAttentionImpl(FlexAttentionImpl):
+        """Override KV cache 寫入：FlexAttention 用 CUDA op
+        （torch.ops._C_cache_ops.reshape_and_cache_flash），CPU 上不存在。
+        改用純 torch 的 scatter 寫入（教學用，效能不追求）。"""
+
+        def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                    output=None, output_scale=None, output_block_scale=None):
+            if attn_metadata is None:
+                return output
+
+            num_actual_tokens = attn_metadata.num_actual_tokens
+
+            # KV cache 寫入：純 torch 版的 reshape_and_cache_flash
+            # kv_cache shape: (2, num_blocks, block_size, num_kv_heads,
+            #                  head_size)
+            if self.kv_sharing_target_layer_name is None:
+                key_cache, value_cache = kv_cache.unbind(0)
+                slot_mapping = attn_metadata.slot_mapping
+                flat_k = key_cache.view(-1, key_cache.shape[-2],
+                                        key_cache.shape[-1])
+                flat_v = value_cache.view(-1, value_cache.shape[-2],
+                                          value_cache.shape[-1])
+                valid = slot_mapping >= 0
+                slots = slot_mapping[valid]
+                flat_k[slots] = key[valid]
+                flat_v[slots] = value[valid]
+
+            return super().forward(layer, query, key, value, kv_cache,
+                                   attn_metadata, output, output_scale,
+                                   output_block_scale)
+
+    class XPUFakeAttentionBackend(FlexAttentionBackend):
+
+        @staticmethod
+        def get_impl_cls():
+            return XPUFakeAttentionImpl
+
+    logger.warning(
+        "[XPUFakeAttention] TorchSDPABackend not found in this vLLM "
+        "version (坑 6: version drift); falling back to FlexAttention.")

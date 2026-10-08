@@ -911,6 +911,23 @@ metadata builder、sampler、rejection sampler（Triton kernel）。
 盤點方法：grep `torch.ops._C` / `@triton.jit` 於你繼承的上游檔案，
 逐個決定「override / 禁用功能 / 補實作」。
 
+### 坑 9：先查上游有沒有現成的同類後端（總結坑 2/6/8）
+
+**教訓**：坑 2（CUDA wrapper）、坑 6（backend 版本漂移）、坑 8（CUDA op）
+三個問題，vLLM 官方 CPU 後端**全部已經解過**——
+`CPUModelRunner(GPUModelRunner)` 內建 `_torch_cuda_wrapper`、
+`_init_device_properties/_sync_device` override、`_postprocess_tensors`，
+且與 CPU 的 attention backend 原生搭配。
+
+**修正**（已套用）：
+- `fake_model_runner.py`：改繼承 `CPUModelRunner`（刪掉自補的 wrapper 與 override）
+- `fake_attention.py`：防禦式 import `TorchSDPABackend`（有就用，
+  沒有 fallback 到 FlexAttention + 純 torch KV 寫入）
+
+**規則**：寫插件前先盤點 vLLM 內建後端（cpu/xpu/tpu/rocm…），
+**有同類後端就繼承它，沒有才自寫**——真插件（TPU/RBLN）自寫 runner
+是因為執行語義完全不同（JAX/編譯 artifact），不是因為上游沒有。
+
 ---
 
 ## 10. 從假插件到真插件：成長路徑（每一步換掉什麼）
