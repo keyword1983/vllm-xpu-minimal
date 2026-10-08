@@ -32,8 +32,8 @@
 >         ├── __init__.py
 >         ├── worker/
 >         │   ├── __init__.py
->         │   ├── fake_worker.py      # XPUFakeWorker（管家）
->         │   └── fake_model_runner.py# XPUFakeModelRunner（主廚）
+>         │   ├── fake_worker.py      # XPUFakeWorker（管家，繼承 CPUWorker 模擬硬體接入）
+>         │   └── fake_model_runner.py# XPUFakeModelRunner（主廚，繼承 CPUModelRunner / CPURunner）
 >         └── attention/
 >             ├── __init__.py
 >             └── fake_attention.py   # 假 attention backend（爐台）
@@ -349,16 +349,14 @@ class XPUFakePlatform(Platform):
 
 ---
 
-## 5. `v1/worker/fake_worker.py` — Worker（管家）
+### 5. `v1/worker/fake_worker.py` — Worker（管家，繼承 CPUWorker）
 
 ```python
 # vllm_xpu_minimal/v1/worker/fake_worker.py
-"""XPUFakeWorker：vLLM executor 與「裝置世界」之間的橋。
+"""XPUFakeWorker：vLLM executor 與「Fake XPU 裝置世界」之間的橋樑。
 
-WorkerBase 的必答題（vLLM 會依序呼叫）：
-  init_device() → load_model() → determine_available_memory()
-  → initialize_from_config(kv_cache_config) → compile_or_warm_up_model()
-  → execute_model() / sample_tokens()（serving 迴圈）
+繼承體系：WorkerBase -> Worker (gpu_worker) -> CPUWorker -> XPUFakeWorker
+以 CPU 模擬 Fake XPU 硬體接入（Hardware Attachment Demo）。
 
 【真插件對照】
 - tpu-inference: worker/tpu_worker.py（JAX 裝置隔離 env、假 torch.distributed）
@@ -368,204 +366,201 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.cpu_worker import CPUWorker
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.worker_base import CompilationTimes
 
 logger = logging.getLogger(__name__)
 
 
-class XPUFakeWorker(WorkerBase):
+class XPUFakeWorker(CPUWorker):
+    """Fake XPU Worker（繼承 CPUWorker，以 CPU 模擬硬體接入）。"""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # 【真插件】RBLN 在這裡關掉 custom all-reduce（走自家 CCL）
-        self.parallel_config.disable_custom_all_reduce = True
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception as e:
+            logger.warning(
+                "[XPUFakeWorker] CPUWorker.__init__ fallback: %s", e)
+            from vllm.v1.worker.gpu_worker import Worker
+            Worker.__init__(self, *args, **kwargs)
 
-    # ---- 生命週期 1：裝置 ----
+        self.parallel_config.disable_custom_all_reduce = True
+        logger.info(
+            "[XPUFakeWorker] Worker initialized (inheriting CPUWorker). "
+            "Simulating Fake XPU accelerator attached to Host.")
+
+    # ---- 生命週期 1：裝置初始化 (Hardware Attach Demo) ----
 
     def init_device(self) -> None:
-        """【真插件】這裡是裝置初始化的重頭戲：
-        - TPU：設 TPU_VISIBLE_CHIPS 等 env → jax.devices() →
-          假的 torch.distributed init（world_size=1, gloo file://）
-        - RBLN：RBLN_VISIBLE_DEVICES → init_worker_distributed_environment
-          （真分散式，rbln-ccl backend）
-        假插件：直接用 CPU。"""
-        self.device = torch.device("cpu")
-        torch.manual_seed(self.model_config.seed or 0)
-        logger.info("[XPUFakeWorker] init_device: using CPU (fake device).")
+        """模擬 Fake XPU 硬體接入與裝置初始化。"""
+        logger.info("==================================================================")
+        logger.info("[XPUFakeWorker] [Hardware Demo] Connecting to Fake XPU Accelerator...")
+        logger.info("[XPUFakeWorker] [Hardware Demo] Device: TranXform XPU-v1 (Simulated on CPU)")
+        logger.info("[XPUFakeWorker] [Hardware Demo] Bus Info: PCIe Gen5 x16 @ NUMA Node 0")
+        logger.info("[XPUFakeWorker] [Hardware Demo] Driver Version: fake-xpu-drv-v1.0.0 (active)")
+        logger.info("==================================================================")
 
-        # 建 ModelRunner（真插件在這裡傳入 devices/rank 等資訊）
+        # 走 CPUWorker 初始化建立分散式環境 (gloo backend) 與執行緒設定
+        super().init_device()
+        self.device = torch.device("cpu")
+
+        # ★ 關鍵：將 model_runner 替換為我們自訂的 XPUFakeModelRunner
         from vllm_xpu_minimal.v1.worker.fake_model_runner import XPUFakeModelRunner
         self.model_runner = XPUFakeModelRunner(self.vllm_config, self.device)
+        logger.info(
+            "[XPUFakeWorker] Fake XPU hardware attached successfully. "
+            "ModelRunner instantiated: %s", type(self.model_runner).__name__)
 
-    # ---- 生命週期 2：模型 ----
+    # ---- 生命週期 2：模型載入 ----
 
-    def load_model(self) -> None:
-        """【真插件】TPU：get_model()（兩條路徑分岔）→ jax.clear_caches()。
-        假插件：直接用 vLLM 原生 loader（CPU 上）。"""
-        from vllm.config import set_current_vllm_config
-        with set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
-        logger.info("[XPUFakeWorker] load_model done.")
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        logger.info("[XPUFakeWorker] [Hardware Demo] Loading model weights into simulated XPU memory...")
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        logger.info("[XPUFakeWorker] [Hardware Demo] Model loaded successfully.")
 
-    # ---- 生命週期 3：記憶體探測（KV cache 協議的第一步）----
+    # ---- 生命週期 3：記憶體探測 (KV cache 協議) ----
 
     def determine_available_memory(self) -> int:
-        """回傳「可用於 KV cache 的 bytes」。vLLM 用它算 num_blocks。
-
-        【真插件】三種做法：
-        - TPU：HBM limit × gpu_memory_utilization − used（靜態查詢）
-        - RBLN：手動數 runtime 數量 + 量化感知 byte 估算 +
-          Dynamic KV Sizer（編譯後量測）
-        - GPU：profile_run() 量測峰值
-        假插件：總記憶體 × util − 模型大小（粗估）。"""
         from vllm_xpu_minimal.envs import XPU_FAKE_DEVICE_MEMORY_BYTES
-        util = self.cache_config.gpu_memory_utilization
-        model_bytes = sum(
-            p.numel() * p.element_size()
-            for p in self.model_runner.model.parameters())
-        available = int(XPU_FAKE_DEVICE_MEMORY_BYTES * util - model_bytes)
+        logger.info("[XPUFakeWorker] [Hardware Demo] Querying Fake XPU onboard memory...")
+        try:
+            if hasattr(self.model_runner, "warming_up_model"):
+                self.model_runner.warming_up_model()
+            elif hasattr(self.model_runner, "dummy_warmup"):
+                self.model_runner.dummy_warmup()
+
+            util = self.cache_config.gpu_memory_utilization
+            model_bytes = sum(
+                p.numel() * p.element_size()
+                for p in self.model_runner.model.parameters())
+            simulated_total = XPU_FAKE_DEVICE_MEMORY_BYTES
+            available = int(simulated_total * util - model_bytes)
+
+            logger.info(
+                "[XPUFakeWorker] Fake XPU Onboard Memory: Total=%.2f GiB, "
+                "Model=%.2f GiB, Available for KV=%.2f GiB (util=%.2f)",
+                simulated_total / 2**30, model_bytes / 2**30,
+                available / 2**30, util)
+            if available <= 0:
+                return super().determine_available_memory()
+            return available
+        except Exception as e:
+            logger.info("[XPUFakeWorker] Custom memory calculation fallback: %s", e)
+            return super().determine_available_memory()
+
+    # ---- 生命週期 4：KV Cache 配置 ----
+
+    def initialize_from_config(self, kv_cache_config: "KVCacheConfig") -> None:
         logger.info(
-            "[XPUFakeWorker] determine_available_memory: %.2f GiB "
-            "(total=%.2f GiB, model=%.2f GiB)",
-            available / 2**30, XPU_FAKE_DEVICE_MEMORY_BYTES / 2**30,
-            model_bytes / 2**30)
-        if available <= 0:
-            raise ValueError(
-                f"Model ({model_bytes / 2**30:.2f} GiB) does not fit in "
-                f"fake device memory. Reduce model size or increase "
-                f"XPU_FAKE_DEVICE_MEMORY_BYTES.")
-        return available
+            "[XPUFakeWorker] [Hardware Demo] Initializing %d KV cache blocks on Fake XPU...",
+            kv_cache_config.num_blocks)
+        super().initialize_from_config(kv_cache_config)
+        logger.info("[XPUFakeWorker] [Hardware Demo] KV cache allocation complete.")
 
-    # ---- 生命週期 4：KV cache 配置（協議的第二步）----
+    # ---- 生命週期 5：編譯與暖機 ----
 
-    def get_kv_cache_spec(self) -> dict:
-        """告訴 vLLM 每層要什麼 cache（形狀/大小宣告）。
-        【真插件】從 attention 模組的 get_kv_cache_spec() 收集。"""
-        return self.model_runner.get_kv_cache_spec()
+    def compile_or_warm_up_model(self) -> "CompilationTimes":
+        logger.info("[XPUFakeWorker] [Hardware Demo] Warming up Fake XPU execution graph...")
+        times = super().compile_or_warm_up_model()
+        logger.info("[XPUFakeWorker] [Hardware Demo] Warmup finished successfully.")
+        return times
 
-    def initialize_from_config(self, kv_cache_config) -> None:
-        """vLLM 算好 num_blocks 後呼叫——一次性配置 KV cache 實體。
-        【真插件】TPU：先 precompile 大 vocab 函數（防 OOM）→ 配 jax.Array。
-        【真插件】RBLN：Dynamic KV Sizer 可能在此後 resize。"""
-        self.model_runner.initialize_kv_cache(kv_cache_config)
-        logger.info("[XPUFakeWorker] KV cache initialized: %d blocks",
-                    kv_cache_config.num_blocks)
-
-    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
-    # ---- 生命週期 5：編譯/warmup ----
-
-    def compile_or_warm_up_model(self):
-        """【真插件】TPU：capture_model()（26 個 _precompile_*，bucketing 全組合）。
-        【真插件】RBLN：run_model_graphs()（每個 decode bucket × query len 的 dummy run）
-        + mega-cache load/save。
-        假插件：無編譯，只 warmup 一次 dummy run。"""
-        self.model_runner.dummy_warmup()
-        logger.info("[XPUFakeWorker] warmup done.")
-
-    # ---- Serving 迴圈 ----
-
-    def execute_model(self, scheduler_output: "SchedulerOutput",
-                      intermediate_tensors=None) -> Optional["ModelRunnerOutput"]:
-        """【真插件】PP 時負責中間 tensor 的 send/recv（TPU 用 step_counter 算 uuid）。"""
-        return self.model_runner.execute_model(scheduler_output,
-                                               intermediate_tensors)
-
-    def sample_tokens(self, grammar_output) -> "ModelRunnerOutput":
-        return self.model_runner.sample_tokens(grammar_output)
-
-    def get_model(self):
-        return self.model_runner.get_model()
+    # ---- 裝置健康檢查 ----
 
     def check_health(self) -> None:
-        """【真插件】探測裝置狀態（RBLN 查 DRAM used）。"""
+        """探測 Fake XPU 裝置狀態（模擬硬體心跳檢查）。"""
         return
 ```
 
 ---
 
-## 6. `v1/worker/fake_model_runner.py` — ModelRunner（主廚）
+## 6. `v1/worker/fake_model_runner.py` — ModelRunner（主廚，繼承 CPUModelRunner / CPURunner）
 
 ```python
 # vllm_xpu_minimal/v1/worker/fake_model_runner.py
-"""XPUFakeModelRunner：插件 80% 的程式碼在這一層。
+"""XPUFakeModelRunner：插件的核心執行層（主廚）。
 
 職責：SchedulerOutput（純 CPU dict）→ device 輸入 → 執行 → ModelRunnerOutput。
 
-【真插件對照】
-- tpu-inference: runner/tpu_runner.py（3285 行：bucketing、DeviceBuffer、
-  persistent batch manager 群、async placeholder、continue_decode）
-- vllm-rbln:     v1/worker/rbln_model_runner.py（3793 行：decode bucket、
-  InputStager、DP 形狀協調、mega-cache）
-- 上游原版:      vllm/v1/worker/gpu_model_runner.py
+【繼承架構】
+繼承 vLLM 原生 CPUModelRunner（別名 CPURunner）：
+- 內建 _torch_cuda_wrapper（Event/Stream placeholder）
+- 已處理 _init_device_properties / _sync_device override
+- 已整合 _postprocess_tensors（將 CpuGpuBuffer 導向 CPU）
+- 原生適配 CPU attention backend
 
-假插件策略：**繼承 GPUModelRunner 但把 device 換成 CPU**——
-這是 vLLM 自己 CPU 後端（CPUModelRunner(GPUModelRunner)）的官方做法，
-讓我們專注在「插件骨架」而非「runner 邏輯」。
+【真插件對照】
+- 真 XPU 插件在此負責：
+  1. 輸入準備（DeviceBuffer / H2D 串流）
+  2. 算子執行（呼叫 XPU Runtime 或 torch.compile 捕捉的靜態圖）
+  3. 取樣（在裝置端執行或搬回 Host 取樣）
+- 本 demo 繼承 CPUModelRunner，以 CPU 模擬硬體執行，展示外掛接入點。
 """
 import logging
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.cpu_model_runner import CPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import ModelRunnerOutput
 
 logger = logging.getLogger(__name__)
 
 
-class XPUFakeModelRunner(GPUModelRunner):
-    """繼承上游 GPU runner，全部運算落在 CPU。
+class XPUFakeModelRunner(CPUModelRunner):
+    """繼承 vLLM 官方 CPUModelRunner，模擬 Fake XPU 運算執行。"""
 
-    【真插件不會這樣做】——真插件會自己寫 runner（因為要控制
-    輸入準備、執行方式、取樣位置）。這裡繼承是教學取捨：
-    讓最小插件能真的跑通，同時保留「要替換的接縫」註解。
-    """
-
-    def __init__(self, vllm_config, device: torch.device):
-        # GPUModelRunner 會用 current_platform 判斷裝置；
-        # 假平台回 CPU，所以直接可用。
+    def __init__(self, vllm_config: "VllmConfig", device: torch.device):
         super().__init__(vllm_config, device)
         logger.info(
-            "[XPUFakeModelRunner] initialized (inheriting GPUModelRunner, "
-            "device=%s). 真插件會自寫 runner：見 tpu_runner.py / "
-            "rbln_model_runner.py 的接縫註解。", device)
+            "[XPUFakeModelRunner] Initialized Fake XPU ModelRunner "
+            "(inheriting CPUModelRunner/CPURunner, device=%s).", device)
 
-    # ---- 接縫 1：KV cache spec（真插件必寫）----
-    # get_kv_cache_spec() 繼承自 GPUModelRunner：從 static_forward_context
-    # 的 Attention 模組收集 spec。真插件的差異點：
-    #   - TPU：head_size 對齊 128、page size 由 SMEM 反推、hybrid 補償
-    #   - RBLN：大 block（1k-4k）+ sub-block caching
+    # ---- 模型載入 ----
 
-    # ---- 接縫 2：KV cache 配置（真插件必寫）----
-    # initialize_kv_cache() 繼承自 GPUModelRunner：torch.zeros 配置。
-    # 真插件的差異點：
-    #   - TPU：jax.Array + NamedSharding 分片 + 一次性配置
-    #   - RBLN：graph input tensor + kv_cache_bases 共享基底
+    def load_model(self, load_dummy_weights: bool = False) -> None:
+        logger.info(
+            "[XPUFakeModelRunner] [FakeXPU Hardware] Loading model weights into simulated XPU memory...")
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        logger.info(
+            "[XPUFakeModelRunner] [FakeXPU Hardware] Weights successfully loaded.")
 
-    # ---- 接縫 3：執行（真插件必寫）----
-    # execute_model()/sample_tokens() 繼承自 GPUModelRunner。
-    # 真插件的差異點：
-    #   - TPU：model_fn 是 jit 過的（donate KV cache）、
-    #     _prepare_inputs 用 DeviceBuffer 一次 H2D、
-    #     async placeholder substitution
-    #   - RBLN：model_executable 是 torch.compile 過的、
-    #     InputStager 暫存輸入、單相 batch
+    # ---- 暖機與預編譯 (AOT / JIT Warmup) ----
+
+    def warming_up_model(self) -> None:
+        """暖機：跑 dummy forward（模擬 XPU AOT precompile / warm-up）。"""
+        logger.info(
+            "[XPUFakeModelRunner] [FakeXPU Hardware] Executing warmup pass on simulated XPU pipelines...")
+        super().warming_up_model()
+        logger.info(
+            "[XPUFakeModelRunner] [FakeXPU Hardware] Warmup pass completed.")
 
     def dummy_warmup(self) -> None:
-        """最小 warmup：跑一次 dummy forward（真插件的 bucketing 迴圈的縮影）。"""
-        try:
-            self._dummy_run(self.max_num_tokens)
-            logger.info("[XPUFakeModelRunner] dummy warmup ok "
-                        "(num_tokens=%d)", self.max_num_tokens)
-        except Exception as e:
-            # warmup 失敗不擋啟動（教學插件寬容；真插件 fail-fast）
-            logger.warning("[XPUFakeModelRunner] dummy warmup failed: %s", e)
+        """向下相容的 warmup 入口。"""
+        self.warming_up_model()
+
+    # ---- 執行模型 (Inference Execution) ----
+
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors=None,
+    ) -> Optional["ModelRunnerOutput"]:
+        return super().execute_model(scheduler_output, intermediate_tensors)
+
+
+# 別名導出（支持 CPURunner / XPUFakeCPURunner 命名）
+CPURunner = CPUModelRunner
+XPUFakeCPURunner = XPUFakeModelRunner
 ```
 
 ---
@@ -668,17 +663,19 @@ print([f'{e.name} -> {e.value}' for e in entry_points(group='vllm.platform_plugi
 VLLM_XPU_FAKE=1 python -c "
 import vllm.platforms as p
 print(type(p.current_platform))   # <class '...XPUFakePlatform'>
-print(p.current_platform.device_name)  # XPU-Fake-Device"
+print(p.current_platform.get_device_name())  # TranXform-XPU-Fake-Device (CPU-Emulated)"
 
 # 4. 跑通 serve（小模型）
 VLLM_XPU_FAKE=1 vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 512
 # 日誌檢查點：
 #   "Platform plugin xpu_fake is activated"
-#   "[XPUFakePlatform] worker_cls -> XPUFakeWorker"
-#   "[XPUFakeWorker] init_device: using CPU (fake device)."
-#   "[XPUFakeWorker] determine_available_memory: ... GiB"
-#   "[XPUFakeWorker] KV cache initialized: N blocks"
-#   "[XPUFakeWorker] warmup done."
+#   "[XPUFakePlatform] [Hardware Demo] Assigned worker_cls -> XPUFakeWorker (inheriting CPUWorker)"
+#   "[XPUFakeWorker] [Hardware Demo] Connecting to Fake XPU Accelerator..."
+#   "[XPUFakeWorker] [Hardware Demo] Device: TranXform XPU-v1 (Simulated on CPU)"
+#   "[XPUFakeWorker] Fake XPU hardware attached successfully. ModelRunner instantiated: XPUFakeModelRunner"
+#   "[XPUFakeWorker] [Hardware Demo] Querying Fake XPU onboard memory..."
+#   "[XPUFakeWorker] [Hardware Demo] Initializing N KV cache blocks on Fake XPU..."
+#   "[XPUFakeWorker] [Hardware Demo] Warming up Fake XPU execution graph..."
 
 # 5. 發一個請求
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
@@ -920,13 +917,28 @@ metadata builder、sampler、rejection sampler（Triton kernel）。
 且與 CPU 的 attention backend 原生搭配。
 
 **修正**（已套用）：
-- `fake_model_runner.py`：改繼承 `CPUModelRunner`（刪掉自補的 wrapper 與 override）
+- `fake_worker.py`：改繼承 `CPUWorker`（復用上游 CPU 的分散式環境與執行管線，模擬硬體接入）
+- `fake_model_runner.py`：改繼承 `CPUModelRunner`（CPURunner，刪掉自補的 wrapper 與 override）
 - `fake_attention.py`：防禦式 import `TorchSDPABackend`（有就用，
   沒有 fallback 到 FlexAttention + 純 torch KV 寫入）
 
 **規則**：寫插件前先盤點 vLLM 內建後端（cpu/xpu/tpu/rocm…），
 **有同類後端就繼承它，沒有才自寫**——真插件（TPU/RBLN）自寫 runner
 是因為執行語義完全不同（JAX/編譯 artifact），不是因為上游沒有。
+
+### 坑 10：Worker 與 Runner 同步繼承 CPU 棧（CPUWorker + CPUModelRunner）以展示硬體接入
+
+**背景**：
+在真實 XPU 晶片與 PrivateUse1 driver 尚未就緒前，需要一個完整的 Fake XPU 插件骨架來打通 vLLM 的控制面與推理協議流程。
+
+**解法**：
+1. **`XPUFakeWorker` 繼承 `CPUWorker`**：
+   - 自動獲得 `WorkerBase` / `Worker` 的全生命週期骨架（`load_model`, `initialize_from_config`, `execute_model` 等）。
+   - 在 `init_device()` 中模擬硬體接入日誌（PCIe 拓撲、假驅動版本），並將 `self.model_runner` 替換為 `XPUFakeModelRunner`。
+   - 在 `determine_available_memory()` 中模擬 XPU 板載獨立記憶體（LPDDR/HBM），並保留 Host CPU 記憶體作為 fallback。
+2. **`XPUFakeModelRunner` 繼承 `CPUModelRunner` (CPURunner)**：
+   - 確保張量完全在 CPU 上安全運算，規避 GPUModelRunner 的 CUDA 呼叫點。
+   - 保留真實 XPU 插件的接入點註解（H2D 串流、AOT warmup、Graph Capture）。
 
 ---
 
@@ -936,8 +948,8 @@ metadata builder、sampler、rejection sampler（Triton kernel）。
 |---|---|---|---|
 | 1. 偵測 | env var 開關 | SDK 探測（`rebel.get_npu_name()` 式） | rbln `get_device_name` |
 | 2. dispatch_key | "CPU" | "PrivateUse1"（SDK 註冊 torch 裝置後） | vllm-ascend torch_npu |
-| 3. Worker.init_device | CPU | SDK 裝置初始化 + 真分散式 init | rbln `init_device` |
-| 4. Runner | 繼承 GPUModelRunner | 自寫（輸入準備/執行/取樣全接管） | tpu_runner / rbln_model_runner |
+| 3. Worker | 繼承 CPUWorker（CPU 模擬硬體接入） | 自寫 Worker + SDK 裝置初始化 + 真分散式 init | rbln `init_device` |
+| 4. Runner | 繼承 CPUModelRunner（CPURunner） | 自寫（輸入準備/執行/取樣全接管） | tpu_runner / rbln_model_runner |
 | 5. 模型 | vLLM 原生 loader | graph capture（torch.compile + 自家 backend） | rbln `compile()` |
 | 6. Attention | 繼承 TorchSDPA | 自寫三件組 + XPU kernel | 兩插件的 backend |
 | 7. KV cache | torch.zeros | graph input tensor / 靜態 jax.Array + dynamic sizing | rbln dynamic_kv_sizer |

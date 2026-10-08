@@ -48,7 +48,7 @@ class XPUFakePlatform(Platform):
         失敗要有 fallback（RBLN 用 RBLN_FORCE_NPU_NAME env）。
         ★ 顯示用的自訂名稱放這裡（classmethod），不要放 device_name 屬性——
         屬性會被 GroupCoordinator 拿去建 torch.device（見上方註解）。"""
-        return "XPU-Fake-Device"
+        return "TranXform-XPU-Fake-Device (CPU-Emulated)"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -191,7 +191,7 @@ class XPUFakePlatform(Platform):
         if pc.worker_cls == "auto":
             pc.worker_cls = ("vllm_xpu_minimal.v1.worker.fake_worker."
                              "XPUFakeWorker")
-            logger.info("[XPUFakePlatform] worker_cls -> XPUFakeWorker")
+            logger.info("[XPUFakePlatform] [Hardware Demo] Assigned worker_cls -> XPUFakeWorker (inheriting CPUWorker)")
 
         # 5. executor backend（抄 TPU：單機強制 uni）
         if pc.distributed_executor_backend in (None, "auto"):
