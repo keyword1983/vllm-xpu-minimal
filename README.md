@@ -936,13 +936,35 @@ RuntimeError: Sleep mode allocator is not available on platform XPUFakePlatform 
 
 **原因分析**：
 1. vLLM V1 的 `Worker.load_model()` 與 `Worker.initialize_from_config()` 會呼叫 `_maybe_get_memory_pool_context(tag)`。
-2. 上游原生邏輯僅豁免了 `is_cuda_alike()`、`is_xpu()` 與內建的 `is_cpu()`。
 3. 自訂 OOT 平台（`_enum = PlatformEnum.OOT`）預設 `is_cpu()` 為 `False`，因此跌入 `get_mem_allocator_instance()`。
 4. `get_mem_allocator_instance()` 僅支援 CUDA 與 Intel XPU，對 OOT 平台直接拋錯崩潰。
 
 **雙重防禦解法**：
 1. **Worker 層防護**：在 `fake_worker.py` 中覆寫 `_maybe_get_memory_pool_context(self, tag=None)`，直接回傳 `nullcontext()`。
 2. **Platform 層防護**：在 `fake_platform.py` 中覆寫 `is_cpu(self) -> bool: return True`，讓 vLLM 內部所有硬體邏輯正確辨識為 CPU 模擬平台。
+
+---
+
+### 坑 12：BlockTable 內建 Triton Kernel 洩漏至 CPU 棧（`TypeError: Cannot inspect kernel parameters for function`）
+
+**現象**：
+在 Server 接收推論請求時（`execute_model` 階段），`_prepare_inputs` 呼叫 `BlockTable.compute_slot_mapping` 噴錯：
+```text
+File ".../vllm/v1/worker/block_table.py", line 214, in compute_slot_mapping
+    _COMPUTE_SLOT_MAPPING_KERNEL(...)
+File ".../vllm/model_executor/warmup/jit_warmup_triton_helper.py", line 268, in _kernel_arg_names
+    raise TypeError(f"Cannot inspect kernel parameters for {type(self.kernel).__name__}")
+TypeError: Cannot inspect kernel parameters for function
+```
+
+**原因分析**：
+1. 雖然外掛已改為繼承 `CPUWorker` 與 `CPUModelRunner`，但上游的 `CPUModelRunner` 其實是直接繼承 `GPUModelRunner`，且未重寫 `execute_model()`。
+2. `GPUModelRunner._prepare_inputs` 會調用 `BlockTable.compute_slot_mapping`。
+3. vLLM V1 近期將該函式硬編碼改為調用 Triton JIT Kernel（`_COMPUTE_SLOT_MAPPING_KERNEL`），完全沒有做硬體或 Triton 是否存在的判斷！
+4. 在純 CPU 環境中，Triton 會回退為 `TritonPlaceholder`，導致 `@triton.jit` 回傳原始 Python 函式。`jit_warmup_triton_helper.py` 檢查型別時發現不是編譯過的 Triton 物件，直接拋出 `TypeError` 崩潰。
+
+**解法**：
+在 `fake_model_runner.py` 啟動時 Monkey-Patch `BlockTable.compute_slot_mapping`，提供純 PyTorch 向量化實作，徹底擺脫 Triton 依賴。
 
 ---
 
