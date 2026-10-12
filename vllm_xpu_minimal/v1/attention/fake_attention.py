@@ -239,8 +239,8 @@ else:
                     q_t, k_t, v_t, is_causal=is_causal, enable_gqa=True
                 )  # [1, num_heads, q_len, head_size]
 
-                attn_out = attn_out.transpose(1, 2).reshape(q_len, num_heads * head_size)
-                output[q_start:q_end] = attn_out
+                attn_out = attn_out.transpose(1, 2)  # [1, q_len, num_heads, head_size]
+                output[q_start:q_end] = attn_out.reshape_as(output[q_start:q_end])
 
             return output
 
