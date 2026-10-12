@@ -74,11 +74,21 @@ else:
     from vllm.v1.attention.backends.flex_attention import (
         FlexAttentionBackend, FlexAttentionImpl)
 
+    try:
+        from vllm.v1.attention.backend import AttentionType
+    except ImportError:
+        try:
+            from vllm.attention.backends.abstract import AttentionType
+        except ImportError:
+            AttentionType = None
+
     def _register_cpu_cache_ops() -> None:
         """坑 14：註冊純 PyTorch 版 _C_cache_ops.reshape_and_cache_flash。
 
         在純 CPU / 無 CUDA 擴展環境下，torch.ops._C_cache_ops 不存在。
         使用 torch.library 註冊純 PyTorch fallback。
+        注意：必須使用 4D 切片索引進行真實 in-place 寫入，禁止用 .reshape()
+        （non-contiguous tensor 的 reshape 會產生 copy，導致寫入丟失）。
         """
         try:
             def cpu_reshape_and_cache_flash(
@@ -91,20 +101,24 @@ else:
                 k_scale: float = 1.0,
                 v_scale: float = 1.0,
             ) -> None:
+                # key_cache shape: (num_blocks, block_size, num_kv_heads, head_size)
+                num_blocks = key_cache.shape[0]
+                block_size = key_cache.shape[1]
+                num_kv_heads = key_cache.shape[2]
+                head_size = key_cache.shape[3]
+
                 slot_mapping = slot_mapping.flatten()
-                num_kv_heads = key_cache.shape[-2]
-                head_size = key_cache.shape[-1]
-
-                flat_k = key_cache.reshape(-1, num_kv_heads, head_size)
-                flat_v = value_cache.reshape(-1, num_kv_heads, head_size)
-
-                valid = (slot_mapping >= 0) & (slot_mapping < flat_k.shape[0])
+                valid = (slot_mapping >= 0) & (slot_mapping < num_blocks * block_size)
                 if valid.any():
                     valid_slots = slot_mapping[valid].to(torch.int64)
-                    k_val = key[valid].reshape(-1, num_kv_heads, head_size).to(flat_k.dtype)
-                    v_val = value[valid].reshape(-1, num_kv_heads, head_size).to(flat_v.dtype)
-                    flat_k[valid_slots] = k_val
-                    flat_v[valid_slots] = v_val
+                    b_idx = valid_slots // block_size
+                    b_off = valid_slots % block_size
+
+                    k_val = key[valid].reshape(-1, num_kv_heads, head_size).to(key_cache.dtype)
+                    v_val = value[valid].reshape(-1, num_kv_heads, head_size).to(value_cache.dtype)
+
+                    key_cache[b_idx, b_off, :, :] = k_val
+                    value_cache[b_idx, b_off, :, :] = v_val
 
             lib = torch.library.Library("_C_cache_ops", "FRAGMENT")
             lib.define(
@@ -124,7 +138,7 @@ else:
     class XPUFakeAttentionImpl(FlexAttentionImpl):
         """Override KV cache 寫入：FlexAttention 用 CUDA op
         （torch.ops._C_cache_ops.reshape_and_cache_flash），CPU 上不存在。
-        改用純 torch 寫入。"""
+        改用純 torch 4D 切片 in-place 寫入。"""
 
         def do_kv_cache_update(
             self,
@@ -134,26 +148,29 @@ else:
             kv_cache: torch.Tensor,
             slot_mapping: torch.Tensor,
         ) -> None:
-            if self.attn_type == AttentionType.ENCODER_ONLY:
+            if AttentionType is not None and getattr(self, "attn_type", None) == AttentionType.ENCODER_ONLY:
+                return
+            if "ENCODER_ONLY" in str(getattr(self, "attn_type", "")):
                 return
 
             # kv_cache shape: (num_blocks, num_kv_heads, block_size, 2 * head_size)
-            # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-            key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
-            num_kv_heads = key_cache.shape[-2]
-            head_size = key_cache.shape[-1]
-
-            flat_k = key_cache.reshape(-1, num_kv_heads, head_size)
-            flat_v = value_cache.reshape(-1, num_kv_heads, head_size)
+            num_blocks = kv_cache.shape[0]
+            num_kv_heads = kv_cache.shape[1]
+            block_size = kv_cache.shape[2]
+            head_size = kv_cache.shape[3] // 2
 
             slot_mapping = slot_mapping.flatten()
-            valid = (slot_mapping >= 0) & (slot_mapping < flat_k.shape[0])
+            valid = (slot_mapping >= 0) & (slot_mapping < num_blocks * block_size)
             if valid.any():
                 valid_slots = slot_mapping[valid].to(torch.int64)
-                k_val = key[valid].reshape(-1, num_kv_heads, head_size).to(flat_k.dtype)
-                v_val = value[valid].reshape(-1, num_kv_heads, head_size).to(flat_v.dtype)
-                flat_k[valid_slots] = k_val
-                flat_v[valid_slots] = v_val
+                b_idx = valid_slots // block_size
+                b_off = valid_slots % block_size
+
+                k_val = key[valid].reshape(-1, num_kv_heads, head_size).to(kv_cache.dtype)
+                v_val = value[valid].reshape(-1, num_kv_heads, head_size).to(kv_cache.dtype)
+
+                kv_cache[b_idx, :, b_off, :head_size] = k_val
+                kv_cache[b_idx, :, b_off, head_size:] = v_val
 
         def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                     output=None, output_scale=None, output_block_scale=None):
