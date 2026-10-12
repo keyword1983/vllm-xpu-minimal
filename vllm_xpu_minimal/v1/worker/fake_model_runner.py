@@ -237,7 +237,13 @@ class XPUFakeModelRunner(CPUModelRunner):
 CPURunner = CPUModelRunner
 XPUFakeCPURunner = XPUFakeModelRunner
 
-# 模組載入時立即套用 Patch，確保任何 BlockTable 與 RoPE 建立前已生效
+# 模組載入時立即套用 Patch，確保任何 BlockTable、RoPE 與 KV Cache Ops 建立前已生效
 _patch_block_table_for_cpu()
 _patch_rotary_embedding_for_cpu()
+try:
+    from vllm_xpu_minimal.v1.attention.fake_attention import _register_cpu_cache_ops
+    _register_cpu_cache_ops()
+except Exception:
+    pass
+
 

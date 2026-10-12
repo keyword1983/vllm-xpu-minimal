@@ -229,7 +229,7 @@ class XPUFakePlatform(Platform):
             logger.warning("[XPUFakePlatform] Could not force eager mode "
                            "(vLLM version drift?): %s", e)
 
-        # 8. 確保 BlockTable 與 RoPE 在 CPU 模擬下的 patch 已就緒
+        # 8. 確保 BlockTable, RoPE 與 KV Cache Ops 在 CPU 模擬下的 patch 已就緒
         try:
             from vllm_xpu_minimal.v1.worker.fake_model_runner import (
                 _patch_block_table_for_cpu,
@@ -237,6 +237,10 @@ class XPUFakePlatform(Platform):
             )
             _patch_block_table_for_cpu()
             _patch_rotary_embedding_for_cpu()
+            from vllm_xpu_minimal.v1.attention.fake_attention import (
+                _register_cpu_cache_ops,
+            )
+            _register_cpu_cache_ops()
         except Exception:
             pass
 

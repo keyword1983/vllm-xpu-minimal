@@ -997,6 +997,33 @@ AttributeError: '_OpNamespace' '_C' object has no attribute 'rotary_embedding'
 
 ---
 
+### 坑 14：Attention KV Cache 寫入：`_C_cache_ops.reshape_and_cache_flash` 缺失與 `do_kv_cache_update` 拆分
+
+**現象**：
+在 RoPE 算子成功通過後，執行到 Transformer Attention 層的前向計算時噴錯：
+```text
+File ".../vllm/model_executor/layers/attention/attention.py", line 738, in unified_kv_cache_update
+    attn_layer.impl.do_kv_cache_update(...)
+File ".../vllm/v1/attention/backends/flex_attention.py", line 1267, in do_kv_cache_update
+    torch.ops._C_cache_ops.reshape_and_cache_flash(...)
+AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'reshape_and_cache_flash'
+```
+
+**原因分析**：
+1. **vLLM V1 架構演進**：
+   - 舊版 vLLM 的 KV Cache 寫入通常耦合在 Attention 的 `forward()` 內部。
+   - 新版 vLLM V1 將其拆分至獨立的 `do_kv_cache_update()`（由 `unified_kv_cache_update` 觸發）。
+2. **C++ 依賴斷層與覆寫遺漏**：
+   - `fake_attention.py` 雖然在 `forward()` 裡嘗試覆寫 KV cache 寫入，但未覆寫 `do_kv_cache_update()`！
+   - 當模型執行時，直接跌入上游 `FlexAttentionImpl.do_kv_cache_update()`，其硬編碼調用了 CUDA C++ 內核 `torch.ops._C_cache_ops.reshape_and_cache_flash`。
+   - 在無 CUDA 環境下，`_C_cache_ops` 不存在該方法，觸發崩潰。
+
+**雙重防禦解法**：
+1. **實作 `do_kv_cache_update`**：在 `fake_attention.py` 的 `XPUFakeAttentionImpl` 中實作純 PyTorch 版本的 `do_kv_cache_update`，向量化處理 `(key, value) -> kv_cache` 寫入。
+2. **註冊全域 `_C_cache_ops` Fallback**：透過 `torch.library` 全域註冊 `_C_cache_ops::reshape_and_cache_flash`，保證上游即使直接透過算子調用也能安全執行。
+
+---
+
 ## 10. 從假插件到真插件：成長路徑（每一步換掉什麼）
 
 | 步驟 | 假插件 | 真插件（XPU） | 參考 |
