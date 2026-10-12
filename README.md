@@ -1022,6 +1022,27 @@ AttributeError: '_OpNamespace' '_C_cache_ops' object has no attribute 'reshape_a
 1. **實作 `do_kv_cache_update`**：在 `fake_attention.py` 的 `XPUFakeAttentionImpl` 中實作純 PyTorch 版本的 `do_kv_cache_update`，向量化處理 `(key, value) -> kv_cache` 寫入。
 2. **註冊全域 `_C_cache_ops` Fallback**：透過 `torch.library` 全域註冊 `_C_cache_ops::reshape_and_cache_flash`，保證上游即使直接透過算子調用也能安全執行。
 
+### 坑 15：FlexAttention 在 CPU 上的 Inductor 崩潰與純 PyTorch SDPA 重構
+
+**現象**：
+```text
+torch._inductor.exc.InductorError: LoweringException: AssertionError: KV seqlen must be smaller than the block_mask size in the KV dimension, considering pass a larger block_mask.
+```
+
+**根本原因**：
+1. `FlexAttentionImpl.forward` 內部調用了經過 `torch.compile` 編譯的 `flex_attention_compiled`。
+2. 在 CPU 環境下，PyTorch 2.5 的 Inductor 後端（`flex_cpu.py:323`）對注意力區塊遮罩進行了強制斷言，要求 `KV seqlen` 不能大於 `block_mask` 的大小。
+3. vLLM 在 CPU 上分配的全局物理 KV Cache 池高達 562,704，而單個請求的 block_mask 僅對應 prompt 長度（38），直接導致 CPU Inductor 編譯崩潰。
+
+**標準解法（純 PyTorch SDPA 重構）**：
+在 `XPUFakeAttentionImpl.forward` 中完全繞過 `flex_attention_compiled`，改用 C++ ATen 原生的 `torch.nn.functional.scaled_dot_product_attention`：
+1. **支援 GQA**：開啟 `enable_gqa=True`，直接支援多組 Query 共用 KV 頭（如 Qwen2.5 14:2 分組）。
+2. **Prefill / Decode 雙軌處理**：
+   - Prefill 階段直接使用當前上下文計算因果注意力。
+   - Decode 階段依據 `block_table` 直接從 4D `kv_cache` 向量化提取全部歷史 Token 連續張量，進行增量解碼注意力計算。
+3. **動態自適應形狀**：使用 `output[q_start:q_end] = attn_out.reshape_as(output[q_start:q_end])`，自動相容 2D 與 3D 緩衝區。
+4. **驗證結果**：成功通過 `Qwen/Qwen2.5-0.5B-Instruct` 端到端 Chat Completion 推論測試，30 個 Token 100% 流暢生成！
+
 ---
 
 ## 10. 從假插件到真插件：成長路徑（每一步換掉什麼）
