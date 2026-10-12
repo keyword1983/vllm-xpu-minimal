@@ -97,6 +97,14 @@ class XPUFakePlatform(Platform):
 
     # ---- 能力宣告 ----
 
+    def is_cpu(self) -> bool:
+        """本平台為 CPU 模擬之 OOT 平台，底層依賴 CPU 運算。
+
+        覆寫以防 vLLM 內部加速器專用邏輯（如 memory pool、triton reset_buffer_cache、
+        torch.accelerator.empty_cache）誤將本平台當作 GPU/加速器而調用未支援的 API。
+        """
+        return True
+
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         """【真插件】TPU/RBLN 都回 False 並 warning——如實回報，

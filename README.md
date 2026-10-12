@@ -926,19 +926,23 @@ metadata builder、sampler、rejection sampler（Triton kernel）。
 **有同類後端就繼承它，沒有才自寫**——真插件（TPU/RBLN）自寫 runner
 是因為執行語義完全不同（JAX/編譯 artifact），不是因為上游沒有。
 
-### 坑 10：Worker 與 Runner 同步繼承 CPU 棧（CPUWorker + CPUModelRunner）以展示硬體接入
+### 坑 11：OOT 平台的 Sleep Mode Allocator 陷阱
 
-**背景**：
-在真實 XPU 晶片與 PrivateUse1 driver 尚未就緒前，需要一個完整的 Fake XPU 插件骨架來打通 vLLM 的控制面與推理協議流程。
+**現象**：
+在 `load_model` 階段拋出：
+```text
+RuntimeError: Sleep mode allocator is not available on platform XPUFakePlatform (device_type=cpu).
+```
 
-**解法**：
-1. **`XPUFakeWorker` 繼承 `CPUWorker`**：
-   - 自動獲得 `WorkerBase` / `Worker` 的全生命週期骨架（`load_model`, `initialize_from_config`, `execute_model` 等）。
-   - 在 `init_device()` 中模擬硬體接入日誌（PCIe 拓撲、假驅動版本），並將 `self.model_runner` 替換為 `XPUFakeModelRunner`。
-   - 在 `determine_available_memory()` 中模擬 XPU 板載獨立記憶體（LPDDR/HBM），並保留 Host CPU 記憶體作為 fallback。
-2. **`XPUFakeModelRunner` 繼承 `CPUModelRunner` (CPURunner)**：
-   - 確保張量完全在 CPU 上安全運算，規避 GPUModelRunner 的 CUDA 呼叫點。
-   - 保留真實 XPU 插件的接入點註解（H2D 串流、AOT warmup、Graph Capture）。
+**原因分析**：
+1. vLLM V1 的 `Worker.load_model()` 與 `Worker.initialize_from_config()` 會呼叫 `_maybe_get_memory_pool_context(tag)`。
+2. 上游原生邏輯僅豁免了 `is_cuda_alike()`、`is_xpu()` 與內建的 `is_cpu()`。
+3. 自訂 OOT 平台（`_enum = PlatformEnum.OOT`）預設 `is_cpu()` 為 `False`，因此跌入 `get_mem_allocator_instance()`。
+4. `get_mem_allocator_instance()` 僅支援 CUDA 與 Intel XPU，對 OOT 平台直接拋錯崩潰。
+
+**雙重防禦解法**：
+1. **Worker 層防護**：在 `fake_worker.py` 中覆寫 `_maybe_get_memory_pool_context(self, tag=None)`，直接回傳 `nullcontext()`。
+2. **Platform 層防護**：在 `fake_platform.py` 中覆寫 `is_cpu(self) -> bool: return True`，讓 vLLM 內部所有硬體邏輯正確辨識為 CPU 模擬平台。
 
 ---
 

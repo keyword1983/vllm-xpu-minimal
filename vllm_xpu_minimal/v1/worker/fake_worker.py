@@ -100,6 +100,25 @@ class XPUFakeWorker(CPUWorker):
             type(self.model_runner).__name__,
         )
 
+    # ---- 記憶體池豁免 (避開 Sleep Mode Allocator) ----
+
+    def _maybe_get_memory_pool_context(
+        self, tag: str | None = None
+    ):
+        """豁免 Sleep Mode 記憶體池分配器。
+
+        【坑 10：OOT 平台 Sleep Mode Allocator 陷阱】
+        vLLM 的 Worker.load_model() 與 initialize_from_config() 內部會調用 
+        _maybe_get_memory_pool_context(tag)。
+        vLLM 原生代碼僅對 is_cuda_alike()、is_xpu() 與 in-tree is_cpu() 做了略過豁免；
+        自訂 OOT 平台（_enum = PlatformEnum.OOT）若未實作自訂 Sleep Allocator，
+        預設會跌入 get_mem_allocator_instance() 並拋出：
+          RuntimeError: Sleep mode allocator is not available on platform XPUFakePlatform ...
+        因此在 Worker 層直接覆寫，回傳 nullcontext()。
+        """
+        from contextlib import nullcontext
+        return nullcontext()
+
     # ---- 生命週期 2：模型載入 ----
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
