@@ -968,6 +968,35 @@ TypeError: Cannot inspect kernel parameters for function
 
 ---
 
+### 坑 13：RoPE C++ 算子缺失與 CPU 分發陷阱（`AttributeError: '_OpNamespace' '_C' object has no attribute 'rotary_embedding'`）
+
+**現象**：
+在 Server 進行 Forward Pass 經過 Transformer Attention 層時噴錯：
+```text
+File ".../vllm/model_executor/layers/rotary_embedding/base.py", line 310, in forward_cpu
+    ops.rotary_embedding(...)
+File ".../vllm/_custom_ops.py", line 221, in rotary_embedding
+    torch.ops._C.rotary_embedding(...)
+AttributeError: '_OpNamespace' '_C' object has no attribute 'rotary_embedding'
+```
+
+**原因分析**：
+1. **為什麼繼承了 CPUWorker / CPURunner 還會報錯？**：
+   - `CPUWorker` 與 `CPUModelRunner` 僅負責外圍調度與環境適配（如把 CUDA Event/Stream 轉為 placeholder、將裝置記憶體搬運重導向 CPU）。
+   - 神經網路核心結構（Layers / CustomOps）依然調用統一的 `vllm.model_executor.layers.*`。
+2. **算子分發與 C++ 依賴斷層**：
+   - `RotaryEmbedding` 繼承自 `CustomOp`。因為平台申報 `is_cpu() == True`，`CustomOp.dispatch_forward()` 將前向傳播分發給 `RotaryEmbedding.forward_cpu`。
+   - `forward_cpu` 內部調用 `vllm._custom_ops.rotary_embedding`，而該函式寫死調用 C++ 擴展 `torch.ops._C.rotary_embedding`。
+   - 在 CPU 環境或缺少 CUDA 驅動的環境（如 WSL / 純 CPU），`vllm._C_stable_libtorch.abi3.so` 因缺少 `libcuda.so.1` 無法載入，`torch.ops._C` 命名空間完全為空，直接拋出 `AttributeError` 崩潰。
+   - 事實上，vLLM 原生已經在 `RotaryEmbedding` 實作了純 PyTorch 的向量化版本 `forward_native`，但官方的 `forward_cpu` 卻未實作 fallback！
+
+**雙重防禦解法**：
+在 `fake_model_runner.py` 與 `fake_platform.py` 中實作 `_patch_rotary_embedding_for_cpu()`：
+1. **類別方法重導向**：將 `RotaryEmbedding.forward_cpu` 直接替換為官方內建的純 PyTorch 實作 `RotaryEmbedding.forward_native`。
+2. **全域自訂算子 Fallback**：同時重寫 `vllm._custom_ops.rotary_embedding`，提供基於 PyTorch 向量化的 in-place RoPE 計算，保證無論底層如何調用均不會崩潰。
+
+---
+
 ## 10. 從假插件到真插件：成長路徑（每一步換掉什麼）
 
 | 步驟 | 假插件 | 真插件（XPU） | 參考 |

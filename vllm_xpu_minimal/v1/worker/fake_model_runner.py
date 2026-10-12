@@ -100,11 +100,88 @@ def _patch_block_table_for_cpu() -> None:
         )
 
 
+def _patch_rotary_embedding_for_cpu() -> None:
+    """坑 13：避開 C++ 缺少 torch.ops._C.rotary_embedding 符號。
+
+    在 CPU 或未編譯 C++ RoPE 內核環境下，torch.ops._C 缺少 rotary_embedding。
+    vLLM 原生 RotaryEmbedding.forward_cpu 與 vllm._custom_ops.rotary_embedding
+    會直接噴 AttributeError: '_OpNamespace' '_C' object has no attribute 'rotary_embedding'。
+    在此提供雙重保護：
+    1. 將 RotaryEmbedding.forward_cpu 指向官方已內建的純 PyTorch 實作 forward_native。
+    2. 同時在 vllm._custom_ops.rotary_embedding 提供純 PyTorch 向量化 fallback 實作（確保 in-place 更新語意）。
+    """
+    try:
+        import vllm._custom_ops as ops
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+        from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+        def cpu_rotary_embedding(
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor | None,
+            head_size: int,
+            cos_sin_cache: torch.Tensor,
+            is_neox: bool,
+            rope_dim_offset: int = 0,
+            inverse: bool = False,
+        ) -> None:
+            positions = positions.flatten()
+            num_tokens = positions.shape[0]
+            cos_sin = cos_sin_cache.index_select(0, positions)
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            rotary_dim = cos.shape[-1] * 2
+
+            # Query in-place RoPE
+            q_shape = query.shape
+            q_view = query.reshape(num_tokens, -1, head_size)
+            q_rot = q_view[..., rope_dim_offset : rope_dim_offset + rotary_dim]
+            q_rot_out = ApplyRotaryEmb.forward_static(q_rot, cos, sin, is_neox)
+
+            if q_view.data_ptr() == query.data_ptr():
+                q_view[..., rope_dim_offset : rope_dim_offset + rotary_dim] = q_rot_out
+            else:
+                q_pass_pre = q_view[..., :rope_dim_offset]
+                q_pass_post = q_view[..., rope_dim_offset + rotary_dim :]
+                q_full = torch.cat([q_pass_pre, q_rot_out, q_pass_post], dim=-1).reshape(q_shape)
+                query.copy_(q_full)
+
+            # Key in-place RoPE
+            if key is not None:
+                k_shape = key.shape
+                k_view = key.reshape(num_tokens, -1, head_size)
+                k_rot = k_view[..., rope_dim_offset : rope_dim_offset + rotary_dim]
+                k_rot_out = ApplyRotaryEmb.forward_static(k_rot, cos, sin, is_neox)
+
+                if k_view.data_ptr() == key.data_ptr():
+                    k_view[..., rope_dim_offset : rope_dim_offset + rotary_dim] = k_rot_out
+                else:
+                    k_pass_pre = k_view[..., :rope_dim_offset]
+                    k_pass_post = k_view[..., rope_dim_offset + rotary_dim :]
+                    k_full = torch.cat([k_pass_pre, k_rot_out, k_pass_post], dim=-1).reshape(k_shape)
+                    key.copy_(k_full)
+
+        # 1. 替換全域 ops 進入點
+        ops.rotary_embedding = cpu_rotary_embedding
+
+        # 2. 替換 RotaryEmbedding.forward_cpu 方法
+        RotaryEmbedding.forward_cpu = RotaryEmbedding.forward_native
+
+        logger.info(
+            "[XPUFakeModelRunner] [Hardware Demo] Successfully patched RotaryEmbedding / ops.rotary_embedding for CPU execution."
+        )
+    except Exception as e:
+        logger.warning(
+            "[XPUFakeModelRunner] Failed to patch RotaryEmbedding: %s",
+            e,
+        )
+
+
 class XPUFakeModelRunner(CPUModelRunner):
     """繼承 vLLM 官方 CPUModelRunner，模擬 Fake XPU 運算執行。"""
 
     def __init__(self, vllm_config: "VllmConfig", device: torch.device):
         _patch_block_table_for_cpu()
+        _patch_rotary_embedding_for_cpu()
         super().__init__(vllm_config, device)
         logger.info(
             "[XPUFakeModelRunner] Initialized Fake XPU ModelRunner "
@@ -160,6 +237,7 @@ class XPUFakeModelRunner(CPUModelRunner):
 CPURunner = CPUModelRunner
 XPUFakeCPURunner = XPUFakeModelRunner
 
-# 模組載入時立即套用 Patch，確保任何 BlockTable 建立前已生效
+# 模組載入時立即套用 Patch，確保任何 BlockTable 與 RoPE 建立前已生效
 _patch_block_table_for_cpu()
+_patch_rotary_embedding_for_cpu()
 
