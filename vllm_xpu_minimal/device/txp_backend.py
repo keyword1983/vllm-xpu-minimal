@@ -49,32 +49,39 @@ def directml_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """執行硬體 DirectML 矩陣相乘 C = A * B。
     
     支援 2D 矩陣 (M, K) * (K, N) -> (M, N)。
+    支援自動型態轉換（bfloat16 / float16 -> float32 -> 原型態）。
     若形狀不符合或硬體庫未就緒，自動安全回退至 CPU GEMM。
     """
     if a.dim() == 2 and b.dim() == 2 and a.size(1) == b.size(0):
         lib = _get_lib()
-        if lib is not None and a.dtype == torch.float32 and b.dtype == torch.float32:
-            M, K = a.shape
-            _, N = b.shape
+        if lib is not None:
+            orig_dtype = a.dtype
             
-            # 確保記憶體連續
-            a_contig = a.contiguous()
-            b_contig = b.contiguous()
-            c = torch.empty((M, N), dtype=a.dtype, device=a.device)
-            
+            # 自動型態轉換至 float32 以相容 DirectML C-API
+            a_fp32 = a.to(torch.float32).contiguous() if a.dtype != torch.float32 else a.contiguous()
+            b_fp32 = b.to(torch.float32).contiguous() if b.dtype != torch.float32 else b.contiguous()
+
+            M, K = a_fp32.shape
+            _, N = b_fp32.shape
+
+            c_fp32 = torch.empty((M, N), dtype=torch.float32, device=a.device)
+
             ret = lib.dml_gemm_forward(
-                ctypes.c_void_p(a_contig.data_ptr()),
-                ctypes.c_void_p(b_contig.data_ptr()),
-                ctypes.c_void_p(c.data_ptr()),
+                ctypes.c_void_p(a_fp32.data_ptr()),
+                ctypes.c_void_p(b_fp32.data_ptr()),
+                ctypes.c_void_p(c_fp32.data_ptr()),
                 M, K, N
             )
             if ret == 0:
-                return c
+                if orig_dtype != torch.float32:
+                    return c_fp32.to(orig_dtype)
+                return c_fp32
             else:
                 logger.warning(f"DirectML GEMM 執行失敗 (代碼 {ret})，回退至 CPU 計算")
-    
+
     # 回退計算
     return torch.matmul(a.cpu(), b.cpu()).to(a.device)
+
 
 
 # 4. 透過 torch.library 註冊 aten::mm 到 PrivateUse1
@@ -152,19 +159,21 @@ def patch_torch_linear():
 
     def dml_linear(input, weight, bias=None):
         global g_dml_dispatch_count
-        if input.dtype == torch.float32 and weight.dtype == torch.float32:
-            orig_shape = input.shape
-            in_2d = input.reshape(-1, orig_shape[-1])
-            wt = weight.t().contiguous()
-            out_2d = directml_gemm(in_2d, wt)
-            out = out_2d.reshape(*orig_shape[:-1], weight.size(0))
-            if bias is not None:
-                out = out + bias
-            g_dml_dispatch_count += 1
-            if g_dml_dispatch_count <= 5 or g_dml_dispatch_count % 50 == 0:
-                print(f"⚡ [DirectML iGPU] 第 {g_dml_dispatch_count} 次 Linear 算子已成功派發至 Intel UHD 630 硬體核心！(Shape: {in_2d.shape}x{wt.shape})", flush=True)
-            return out
-        return orig_linear(input, weight, bias)
+        orig_shape = input.shape
+        orig_dtype = input.dtype
+        in_2d = input.reshape(-1, orig_shape[-1])
+        wt = weight.t().contiguous()
+        out_2d = directml_gemm(in_2d, wt)
+        out = out_2d.reshape(*orig_shape[:-1], weight.size(0))
+        if bias is not None:
+            out = out + bias
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
+        g_dml_dispatch_count += 1
+        if g_dml_dispatch_count <= 5 or g_dml_dispatch_count % 50 == 0:
+            print(f"⚡ [DirectML iGPU] 第 {g_dml_dispatch_count} 次 Linear 算子已成功派發至 Intel UHD 630 硬體核心！(Shape: {in_2d.shape}x{wt.shape}, Dtype: {orig_dtype}->fp32)", flush=True)
+        return out
+
 
     F.linear = dml_linear
     F._dml_patched = True

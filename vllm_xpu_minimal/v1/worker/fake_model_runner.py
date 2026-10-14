@@ -249,6 +249,67 @@ def _patch_sampler_for_cpu() -> None:
     except Exception as e:
         logger.warning("[XPUModelRunner] Failed to patch compiled_random_sample: %s", e)
 
+def _patch_linear_for_directml() -> None:
+    """掛載 DirectML 加速算子至 vLLM CPU Linear 派發層，支援自動型態轉換。"""
+    try:
+        from vllm.model_executor.layers import utils as layer_utils
+        from vllm_xpu_minimal.device.txp_backend import directml_gemm
+        import vllm_xpu_minimal.device.txp_backend as txp_backend
+
+        orig_dispatch_cpu_gemm = layer_utils.dispatch_cpu_unquantized_gemm
+
+        def directml_dispatch_cpu_unquantized_gemm(layer: torch.nn.Module, remove_weight: bool) -> None:
+            if layer.weight.is_meta or layer.weight.ndim != 2:
+                orig_dispatch_cpu_gemm(layer, remove_weight)
+                return
+
+            N, K = layer.weight.size()
+            dtype = layer.weight.dtype
+
+            # 預先將 weight 轉置並轉換為 float32，保證推論時零額外轉型與轉置開銷
+            wt_fp32_t = layer.weight.data.to(torch.float32).t().contiguous()
+
+            def dml_cpu_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+                orig_shape = x.shape
+                orig_dtype = x.dtype
+                x_2d = x.reshape(-1, orig_shape[-1])
+
+                # 自動轉型為 float32
+                if x_2d.dtype != torch.float32:
+                    x_2d = x_2d.to(torch.float32)
+
+                out_2d = directml_gemm(x_2d, wt_fp32_t)
+                out = out_2d.reshape(*orig_shape[:-1], N)
+
+                if bias is not None:
+                    out = out + bias
+
+                if out.dtype != orig_dtype:
+                    out = out.to(orig_dtype)
+
+                txp_backend.g_dml_dispatch_count += 1
+                cnt = txp_backend.g_dml_dispatch_count
+                if cnt <= 5 or cnt % 50 == 0:
+                    print(
+                        f"⚡ [DirectML iGPU] 第 {cnt} 次 Linear 算子已成功派發至 Intel UHD 630 硬體核心！"
+                        f"(Shape: {x_2d.shape}x{wt_fp32_t.shape}, Dtype: {orig_dtype}->fp32)",
+                        flush=True,
+                    )
+                return out
+
+            layer.cpu_linear = dml_cpu_linear
+            if remove_weight:
+                layer.weight = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device=layer.weight.device),
+                    requires_grad=False,
+                )
+            logger.info(f"✓ [DirectML iGPU] 成功為層注入 DirectML 硬體算子 (N={N}, K={K}, dtype={dtype})")
+
+        layer_utils.dispatch_cpu_unquantized_gemm = directml_dispatch_cpu_unquantized_gemm
+        logger.info("[XPUModelRunner] Successfully patched dispatch_cpu_unquantized_gemm for DirectML iGPU acceleration.")
+    except Exception as e:
+        logger.warning("[XPUModelRunner] Failed to patch dispatch_cpu_unquantized_gemm: %s", e)
+
 # 別名導出（支持 CPURunner / XPUFakeCPURunner 命名）
 CPURunner = CPUModelRunner
 XPUFakeCPURunner = XPUFakeModelRunner
@@ -257,11 +318,13 @@ XPUFakeCPURunner = XPUFakeModelRunner
 _patch_block_table_for_cpu()
 _patch_rotary_embedding_for_cpu()
 _patch_sampler_for_cpu()
+_patch_linear_for_directml()
 try:
     from vllm_xpu_minimal.v1.attention.fake_attention import _register_cpu_cache_ops
     _register_cpu_cache_ops()
 except Exception:
     pass
+
 
 
 
