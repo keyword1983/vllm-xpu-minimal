@@ -87,37 +87,59 @@ except Exception as e:
     pass
 
 
-# 5. 提供類似 torch.cuda / torch.xpu 的 Python API 門面
-class TXPModule:
-    """提供 `torch.txp` 模組門面。"""
-    
-    @staticmethod
-    def is_available() -> bool:
-        return _get_lib() is not None
+# 5. 提供標準的 torch.txp 模組（注入至 sys.modules 與 torch 命名空間以相容 torch.accelerator）
+import sys
+import types
 
-    @staticmethod
-    def device_count() -> int:
-        return 1
-
-    @staticmethod
-    def current_device() -> int:
-        return 0
-
-    @staticmethod
-    def set_device(device: int) -> None:
+class DummyStream:
+    def __init__(self, device=0, stream_id=0):
+        self.device = torch.device("txp", device)
+        self.stream_id = stream_id
+        self.stream_handle = 0
+    def query(self):
+        return True
+    def synchronize(self):
+        pass
+    def wait_stream(self, stream):
+        pass
+    def wait_event(self, event):
         pass
 
-    @staticmethod
-    def synchronize(device: Optional[int] = None) -> None:
+class DummyEvent:
+    def __init__(self, enable_timing=False, blocking=False, interprocess=False):
+        pass
+    def record(self, stream=None):
+        pass
+    def wait(self, stream=None):
+        pass
+    def query(self):
+        return True
+    def elapsed_time(self, end_event):
+        return 0.0
+    def synchronize(self):
         pass
 
-    @staticmethod
-    def get_device_name(device: int = 0) -> str:
-        return "Intel(R) UHD Graphics 630 (DirectML Accelerated)"
+_default_stream_instance = DummyStream(0, 0)
 
-# 掛載到 torch 命名空間
-if not hasattr(torch, "txp"):
-    torch.txp = TXPModule
+txp_mod = types.ModuleType("torch.txp")
+txp_mod.is_available = lambda: _get_lib() is not None
+txp_mod.device_count = lambda: 1
+txp_mod.current_device = lambda: 0
+txp_mod.set_device = lambda device: None
+txp_mod.synchronize = lambda device=None: None
+txp_mod.get_device_name = lambda device=0: "Intel(R) UHD Graphics 630 (DirectML Accelerated)"
+txp_mod.current_stream = lambda device=None: _default_stream_instance
+txp_mod.default_stream = lambda device=None: _default_stream_instance
+txp_mod.set_stream = lambda stream: None
+txp_mod.Stream = DummyStream
+txp_mod.Event = DummyEvent
+txp_mod.empty_cache = lambda: None
+txp_mod.memory_allocated = lambda device=None: 0
+txp_mod.max_memory_allocated = lambda device=None: 0
+
+# 關鍵：同時註冊到 sys.modules 與 torch.txp
+sys.modules["torch.txp"] = txp_mod
+torch.txp = txp_mod
 
 # 6. 自動攔截 Linear 前向傳播派發至 DirectML 硬體核心
 g_dml_dispatch_count = 0

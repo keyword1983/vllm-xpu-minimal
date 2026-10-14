@@ -233,6 +233,22 @@ class XPUFakeModelRunner(CPUModelRunner):
         return super().execute_model(scheduler_output, intermediate_tensors)
 
 
+def _patch_sampler_for_cpu() -> None:
+    """避開 TopK/TopP Sampler 的 @torch.compile 對 torch.accelerator 的依賴。"""
+    try:
+        from vllm.v1.sample.ops import topk_topp_sampler
+
+        def uncompiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
+            probs = logits.softmax(dim=-1, dtype=torch.float32)
+            q = torch.empty_like(probs)
+            q.exponential_()
+            return probs.div(q).argmax(dim=-1).view(-1)
+
+        topk_topp_sampler.compiled_random_sample = uncompiled_random_sample
+        logger.info("[XPUModelRunner] Successfully patched compiled_random_sample for eager execution.")
+    except Exception as e:
+        logger.warning("[XPUModelRunner] Failed to patch compiled_random_sample: %s", e)
+
 # 別名導出（支持 CPURunner / XPUFakeCPURunner 命名）
 CPURunner = CPUModelRunner
 XPUFakeCPURunner = XPUFakeModelRunner
@@ -240,10 +256,12 @@ XPUFakeCPURunner = XPUFakeModelRunner
 # 模組載入時立即套用 Patch，確保任何 BlockTable、RoPE 與 KV Cache Ops 建立前已生效
 _patch_block_table_for_cpu()
 _patch_rotary_embedding_for_cpu()
+_patch_sampler_for_cpu()
 try:
     from vllm_xpu_minimal.v1.attention.fake_attention import _register_cpu_cache_ops
     _register_cpu_cache_ops()
 except Exception:
     pass
+
 
 

@@ -32,7 +32,7 @@ class XPUFakePlatform(Platform):
     #   顯示用的名稱放 get_device_name()（classmethod），別放這兩個屬性。
     device_name: str = "cpu"
     device_type: str = "cpu"
-    dispatch_key: str = "PrivateUse1"         # 【真插件】"PrivateUse1"（自訂硬體裝置）
+    dispatch_key: str = "CPU"                 # 走 CPU 基底派發，計算核心由 DirectML F.linear 攔截加速
     ray_device_key: str = "TXP"               # 【真插件】Ray 資源標記
     dist_backend: str = "gloo"                # 【真插件】"nccl"/"ccl"/"rbln-ccl"/TPU 不用
     device_control_env_var: str = "TXP_VISIBLE_DEVICES"
