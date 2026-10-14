@@ -32,23 +32,20 @@ class XPUFakePlatform(Platform):
     #   顯示用的名稱放 get_device_name()（classmethod），別放這兩個屬性。
     device_name: str = "cpu"
     device_type: str = "cpu"
-    dispatch_key: str = "CPU"         # 【真插件】"PrivateUse1"（自訂裝置）或 "XLA"（TPU）
-    ray_device_key: str = "XPU_FAKE"  # 【真插件】Ray 資源標記
-    dist_backend: str = "gloo"        # 【真插件】"nccl"/"ccl"/"rbln-ccl"/TPU 不用
-    device_control_env_var: str = "XPU_FAKE_VISIBLE_DEVICES"
-    simple_compile_backend: str = "eager"  # 【真插件】TPU 用 "eager"（繞過 torch.compile）
+    dispatch_key: str = "PrivateUse1"         # 【真插件】"PrivateUse1"（自訂硬體裝置）
+    ray_device_key: str = "TXP"               # 【真插件】Ray 資源標記
+    dist_backend: str = "gloo"                # 【真插件】"nccl"/"ccl"/"rbln-ccl"/TPU 不用
+    device_control_env_var: str = "TXP_VISIBLE_DEVICES"
+    simple_compile_backend: str = "eager"     # 【真插件】TPU 用 "eager"（繞過 torch.compile）
 
-    supported_quantization: list[str] = []  # 【真插件】量化白名單
+    supported_quantization: list[str] = []    # 【真插件】量化白名單
 
     # ---- 裝置查詢 ----
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        """【真插件】查硬體型號：TPU 用 tpu_info、RBLN 用 rebel.get_npu_name()。
-        失敗要有 fallback（RBLN 用 RBLN_FORCE_NPU_NAME env）。
-        ★ 顯示用的自訂名稱放這裡（classmethod），不要放 device_name 屬性——
-        屬性會被 GroupCoordinator 拿去建 torch.device（見上方註解）。"""
-        return "TranXform-XPU-Fake-Device (CPU-Emulated)"
+        """【真插件】查硬體型號。"""
+        return "TranXform-XPU (Intel UHD 630 DirectML Hardware Accelerated)"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:

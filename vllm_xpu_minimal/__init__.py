@@ -29,8 +29,12 @@ def register_ops():
     - 註冊模型（vllm.ModelRegistry.register_model）
     - 觸發 @register_oot decorator（import custom_ops 模組）
     - 註冊 dummy torch ops（torch.library.define）
-    假插件只印一行證明它被執行了。
     """
     import logging
-    logging.getLogger(__name__).info(
-        "[XPUFakePlugin] general_plugins hook executed (idempotent).")
+    try:
+        import vllm_xpu_minimal.device.txp_backend
+        logging.getLogger(__name__).info(
+            "[XPUPlugin] DirectML PrivateUse1 'txp' 後端與算子掛載完成。")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[XPUPlugin] txp_backend 載入失敗: {e}")

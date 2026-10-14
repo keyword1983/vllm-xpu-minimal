@@ -66,16 +66,16 @@ class XPUFakeWorker(CPUWorker):
             "=================================================================="
         )
         logger.info(
-            "[XPUFakeWorker] [Hardware Demo] Connecting to Fake XPU Accelerator..."
+            "[XPUWorker] [Hardware] Connecting to Intel UHD 630 GPU Accelerator..."
         )
         logger.info(
-            "[XPUFakeWorker] [Hardware Demo] Device: TranXform XPU-v1 (Simulated on CPU)"
+            "[XPUWorker] [Hardware] Device: TranXform XPU (Intel UHD 630 DirectML Core)"
         )
         logger.info(
-            "[XPUFakeWorker] [Hardware Demo] Bus Info: PCIe Gen5 x16 @ NUMA Node 0"
+            "[XPUWorker] [Hardware] Bus Info: WDDM 3.0 /dev/dxg (DirectML Accelerated)"
         )
         logger.info(
-            "[XPUFakeWorker] [Hardware Demo] Driver Version: fake-xpu-drv-v1.0.0 (active)"
+            "[XPUWorker] [Hardware] Backend: PrivateUse1 ('txp') via libdml_gemm.so"
         )
         logger.info(
             "=================================================================="
