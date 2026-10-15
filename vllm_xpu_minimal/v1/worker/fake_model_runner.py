@@ -17,9 +17,11 @@
 - 本 demo 繼承 CPUModelRunner，以 CPU 模擬硬體執行，展示外掛接入點。
 """
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 
 if TYPE_CHECKING:
@@ -251,8 +253,12 @@ def _patch_sampler_for_cpu() -> None:
 
 def _patch_linear_for_directml() -> None:
     """掛載 DirectML 加速算子至 vLLM CPU Linear 派發層，支援自動型態轉換。"""
+    if os.environ.get("VLLM_USE_DML", "1") == "0":
+        logger.info("[XPUModelRunner] VLLM_USE_DML=0 偵測到：停用 DirectML 算子掛載，以純 CPU 基準模式執行。")
+        return
     try:
         from vllm.model_executor.layers import utils as layer_utils
+
         from vllm_xpu_minimal.device.txp_backend import directml_gemm
         import vllm_xpu_minimal.device.txp_backend as txp_backend
 

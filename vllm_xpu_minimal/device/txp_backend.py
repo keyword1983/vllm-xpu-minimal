@@ -152,10 +152,14 @@ torch.txp = txp_mod
 g_dml_dispatch_count = 0
 
 def patch_torch_linear():
+    if os.environ.get("VLLM_USE_DML", "1") == "0":
+        logger.info("[DirectML] VLLM_USE_DML=0 偵測到：停用 F.linear DirectML 攔截。")
+        return
     import torch.nn.functional as F
     if getattr(F, "_dml_patched", False):
         return
     orig_linear = F.linear
+
 
     def dml_linear(input, weight, bias=None):
         global g_dml_dispatch_count

@@ -23,18 +23,15 @@ def register():
 
 
 def register_ops():
-    """General plugin：每個 process 啟動時執行。
-
-    真插件在這裡：
-    - 註冊模型（vllm.ModelRegistry.register_model）
-    - 觸發 @register_oot decorator（import custom_ops 模組）
-    - 註冊 dummy torch ops（torch.library.define）
-    """
+    """General plugin：每個 process 啟動時執行。"""
+    if os.environ.get("VLLM_XPU_FAKE", "0") != "1" or os.environ.get("VLLM_USE_DML", "1") == "0":
+        return
     import logging
     try:
         import vllm_xpu_minimal.device.txp_backend
         logging.getLogger(__name__).info(
             "[XPUPlugin] DirectML PrivateUse1 'txp' 後端與算子掛載完成。")
+
     except Exception as e:
         logging.getLogger(__name__).warning(
             f"[XPUPlugin] txp_backend 載入失敗: {e}")
