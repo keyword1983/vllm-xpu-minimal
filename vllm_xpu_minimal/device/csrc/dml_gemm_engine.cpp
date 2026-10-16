@@ -4,6 +4,8 @@
 #include <tuple>
 #include <thread>
 #include <cstring>
+#include <cstdio>
+#include <chrono>
 #include <dlfcn.h>
 #include <wsl/winadapter.h>
 #include <directx/d3d12.h>
@@ -54,6 +56,45 @@ struct CachedOp {
 
 static std::map<std::tuple<uint32_t, uint32_t, uint32_t>, CachedOp> g_opCache;
 
+// ── Stage 0: 效能剖析計數器 ──
+static uint64_t g_gemmCount = 0;
+static double g_gemmH2DMs = 0.0;
+static double g_gemmDispatchMs = 0.0;
+static double g_gemmD2HMs = 0.0;
+static double g_gemmFenceMs = 0.0;
+
+static double nowMs() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ── Stage 1: 裝置常駐張量池（default heap）──
+// dtype: 0 = FLOAT32, 1 = FLOAT16
+struct TensorEntry {
+    ID3D12Resource* resource = nullptr;
+    uint32_t bytes = 0;
+    uint32_t dtype = 0;
+    bool in_use = false;
+};
+
+static std::vector<TensorEntry> g_tensors;
+static std::vector<uint64_t> g_freeTensorIds;
+
+static size_t dtypeSize(uint32_t dtype) {
+    return dtype == 1 ? 2 : 4;
+}
+
+static DML_TENSOR_DATA_TYPE dmlDtype(uint32_t dtype) {
+    return dtype == 1 ? DML_TENSOR_DATA_TYPE_FLOAT16 : DML_TENSOR_DATA_TYPE_FLOAT32;
+}
+
+// Stage 1: handle-based op cache（M, K, N, dtype, fused_activation）
+static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, int>, CachedOp> g_handleOpCache;
+// Stage 1: elementwise mul op cache（count, dtype）
+static std::map<std::tuple<uint32_t, uint32_t>, CachedOp> g_mulCache;
+// Stage 1: sigmoid op cache（count, dtype）
+static std::map<std::tuple<uint32_t, uint32_t>, CachedOp> g_sigmoidCache;
+
 // 緩衝區緩存 (動態增長，避免反覆配置顯存)
 static ID3D12Resource* g_uploadA = nullptr;
 static size_t g_uploadASize = 0;
@@ -71,6 +112,7 @@ static ID3D12Resource* g_readbackC = nullptr;
 static size_t g_readbackCSize = 0;
 
 static void CloseExecuteResetWait() {
+    double t0 = nowMs();
     g_commandList->Close();
     ID3D12CommandList* lists[] = { g_commandList };
     g_commandQueue->ExecuteCommandLists(1, lists);
@@ -82,6 +124,7 @@ static void CloseExecuteResetWait() {
     }
     g_commandAllocator->Reset();
     g_commandList->Reset(g_commandAllocator, nullptr);
+    g_gemmFenceMs += nowMs() - t0;
 }
 
 static D3D12_RESOURCE_DESC makeBufferDesc(size_t size, D3D12_RESOURCE_FLAGS flags) {
@@ -110,6 +153,104 @@ static void ensureBuffer(ID3D12Resource*& buf, size_t& currentSize, size_t neede
     D3D12_HEAP_PROPERTIES heapProps = { heapType, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0 };
     auto desc = makeBufferDesc(neededSize, flags);
     g_d3d_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, initialState, nullptr, IID_ID3D12Resource_val, (void**)&buf);
+}
+
+// ── Stage 1: 通用算子編譯與派發 helper ──
+static CachedOp compileOperator(DML_OPERATOR_DESC* opDesc) {
+    CachedOp result = { nullptr, nullptr, nullptr, 0 };
+
+    IDMLOperator* dmlOperator = nullptr;
+    HRESULT hr = g_dml_device->CreateOperator(opDesc, IID_IDMLOperator_val, (void**)&dmlOperator);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[dml_gemm] CreateOperator failed: 0x%08x\n", (unsigned)hr);
+        return result;
+    }
+
+    IDMLCompiledOperator* compiledOp = nullptr;
+    hr = g_dml_device->CompileOperator(dmlOperator, DML_EXECUTION_FLAG_NONE, IID_IDMLCompiledOperator_val, (void**)&compiledOp);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[dml_gemm] CompileOperator failed: 0x%08x\n", (unsigned)hr);
+        dmlOperator->Release();
+        return result;
+    }
+    dmlOperator->Release();
+
+    IDMLOperatorInitializer* initializer = nullptr;
+    IDMLCompiledOperator* ops[] = { compiledOp };
+    hr = g_dml_device->CreateOperatorInitializer(1, ops, IID_IDMLOperatorInitializer_val, (void**)&initializer);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[dml_gemm] CreateOperatorInitializer failed: 0x%08x\n", (unsigned)hr);
+        compiledOp->Release();
+        return result;
+    }
+
+    DML_BINDING_PROPERTIES initProps = initializer->GetBindingProperties();
+    DML_BINDING_PROPERTIES execProps = compiledOp->GetBindingProperties();
+    uint32_t descriptorCount = std::max(initProps.RequiredDescriptorCount, execProps.RequiredDescriptorCount);
+
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = descriptorCount;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    ID3D12DescriptorHeap* descriptorHeap = nullptr;
+    hr = g_d3d_device->CreateDescriptorHeap(&heapDesc, IID_ID3D12DescriptorHeap_val, (void**)&descriptorHeap);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[dml_gemm] CreateDescriptorHeap failed: 0x%08x\n", (unsigned)hr);
+        initializer->Release();
+        compiledOp->Release();
+        return result;
+    }
+
+    DML_BINDING_TABLE_DESC tableDesc = {};
+    tableDesc.Dispatchable = initializer;
+    tableDesc.CPUDescriptorHandle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    tableDesc.GPUDescriptorHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    tableDesc.SizeInDescriptors = descriptorCount;
+
+    IDMLBindingTable* bindingTable = nullptr;
+    hr = g_dml_device->CreateBindingTable(&tableDesc, IID_IDMLBindingTable_val, (void**)&bindingTable);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[dml_gemm] CreateBindingTable failed: 0x%08x\n", (unsigned)hr);
+        descriptorHeap->Release();
+        initializer->Release();
+        compiledOp->Release();
+        return result;
+    }
+
+    if (initProps.RequiredDescriptorCount > 0 || initProps.PersistentResourceSize > 0) {
+        ID3D12DescriptorHeap* heaps[] = { descriptorHeap };
+        g_commandList->SetDescriptorHeaps(1, heaps);
+        g_commandRecorder->RecordDispatch(g_commandList, initializer, bindingTable);
+        CloseExecuteResetWait();
+    }
+    initializer->Release();
+
+    result.compiledOp = compiledOp;
+    result.descriptorHeap = descriptorHeap;
+    result.bindingTable = bindingTable;
+    result.descriptorCount = descriptorCount;
+    return result;
+}
+
+static int dispatchOperator(CachedOp& op, DML_BINDING_DESC* inputDescs, uint32_t numInputs, DML_BINDING_DESC* outputDesc) {
+    ID3D12DescriptorHeap* heaps[] = { op.descriptorHeap };
+    g_commandList->SetDescriptorHeaps(1, heaps);
+
+    DML_BINDING_TABLE_DESC tableDesc = {};
+    tableDesc.Dispatchable = op.compiledOp;
+    tableDesc.CPUDescriptorHandle = op.descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    tableDesc.GPUDescriptorHandle = op.descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    tableDesc.SizeInDescriptors = op.descriptorCount;
+    op.bindingTable->Reset(&tableDesc);
+
+    op.bindingTable->BindInputs(numInputs, inputDescs);
+
+    op.bindingTable->BindOutputs(1, outputDesc);
+
+    g_commandRecorder->RecordDispatch(g_commandList, op.compiledOp, op.bindingTable);
+    CloseExecuteResetWait();
+    return 0;
 }
 
 extern "C" {
@@ -158,6 +299,8 @@ int dml_gemm_forward(const float* a, const float* b, float* c, uint32_t M, uint3
     if (!g_initialized) {
         if (dml_gemm_init() != 0) return -1;
     }
+
+    double t0 = nowMs();
 
     size_t aBufferSize = (size_t)M * K * sizeof(float);
     size_t bBufferSize = (size_t)K * N * sizeof(float);
@@ -289,10 +432,12 @@ int dml_gemm_forward(const float* a, const float* b, float* c, uint32_t M, uint3
     uploadBarriers[1].Transition.pResource = g_inputB;
     uploadBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     uploadBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    uploadBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+uploadBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g_commandList->ResourceBarrier(2, uploadBarriers);
 
+double t1 = nowMs();
     CloseExecuteResetWait();
+    double t2 = nowMs();
 
     // 4. 重置 Binding Table 並綁定運算
     ID3D12DescriptorHeap* heaps[] = { op.descriptorHeap };
@@ -321,7 +466,9 @@ int dml_gemm_forward(const float* a, const float* b, float* c, uint32_t M, uint3
 
     // 5. 派發執行
     g_commandRecorder->RecordDispatch(g_commandList, op.compiledOp, op.bindingTable);
+    double t3 = nowMs();
     CloseExecuteResetWait();
+    double t4 = nowMs();
 
     // 6. 讀回 (D2H)
     D3D12_RESOURCE_BARRIER readbackBarrier = {};
@@ -338,7 +485,9 @@ int dml_gemm_forward(const float* a, const float* b, float* c, uint32_t M, uint3
     readbackBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     g_commandList->ResourceBarrier(1, &readbackBarrier);
 
+    double t5 = nowMs();
     CloseExecuteResetWait();
+    double t6 = nowMs();
 
     D3D12_RANGE readRange = { 0, cBufferSize };
     float* cMapped = nullptr;
@@ -346,16 +495,400 @@ int dml_gemm_forward(const float* a, const float* b, float* c, uint32_t M, uint3
     memcpy(c, cMapped, cBufferSize);
     g_readbackC->Unmap(0, nullptr);
 
+    double t7 = nowMs();
+
+    // ── Stage 0: 累計剖析統計（fence 由 CloseExecuteResetWait 統一累計）──
+    g_gemmCount++;
+    g_gemmH2DMs += t1 - t0;
+    g_gemmDispatchMs += t3 - t2;
+    g_gemmD2HMs += (t5 - t4) + (t7 - t6);
+
+    return 0;
+}
+
+// ── Stage 0: 剖析統計查詢 ──
+void dml_gemm_get_stats(uint64_t* count, double* h2dMs, double* dispatchMs, double* d2hMs, double* fenceMs) {
+    if (count) *count = g_gemmCount;
+    if (h2dMs) *h2dMs = g_gemmH2DMs;
+    if (dispatchMs) *dispatchMs = g_gemmDispatchMs;
+    if (d2hMs) *d2hMs = g_gemmD2HMs;
+    if (fenceMs) *fenceMs = g_gemmFenceMs;
+}
+
+// ── Stage 1: 裝置常駐張量池 API ──
+int dml_tensor_alloc(uint32_t bytes, uint32_t dtype, uint64_t* out_handle) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (!out_handle) return -2;
+
+    // 先找 free list 中可重用的（同 dtype 且容量足夠）
+    for (size_t i = 0; i < g_freeTensorIds.size(); i++) {
+        uint64_t id = g_freeTensorIds[i];
+        TensorEntry& e = g_tensors[id];
+        if (e.bytes >= bytes && e.dtype == dtype) {
+            e.in_use = true;
+            g_freeTensorIds.erase(g_freeTensorIds.begin() + i);
+            *out_handle = id;
+            return 0;
+        }
+    }
+
+    TensorEntry e;
+    e.bytes = bytes;
+    e.dtype = dtype;
+    e.in_use = true;
+
+    D3D12_HEAP_PROPERTIES heapProps = { D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 0, 0 };
+    auto desc = makeBufferDesc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (FAILED(g_d3d_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_ID3D12Resource_val, (void**)&e.resource))) {
+        return -3;
+    }
+
+    g_tensors.push_back(e);
+    *out_handle = g_tensors.size() - 1;
+    return 0;
+}
+
+int dml_tensor_free(uint64_t handle) {
+    if (handle >= g_tensors.size()) return -3;
+    TensorEntry& t = g_tensors[handle];
+    if (!t.in_use) return 0;
+    t.in_use = false;
+    g_freeTensorIds.push_back(handle);
+    return 0;
+}
+
+int dml_tensor_upload(uint64_t handle, const void* data, uint32_t bytes) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (handle >= g_tensors.size()) return -3;
+    TensorEntry& t = g_tensors[handle];
+    if (!t.in_use) return -3;
+    if (t.bytes < bytes) return -4;
+
+    double t0 = nowMs();
+
+    ensureBuffer(g_uploadA, g_uploadASize, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
+
+    void* mapped = nullptr;
+    g_uploadA->Map(0, nullptr, &mapped);
+    memcpy(mapped, data, bytes);
+    g_uploadA->Unmap(0, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = t.resource;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_commandList->ResourceBarrier(1, &barrier);
+
+    g_commandList->CopyBufferRegion(t.resource, 0, g_uploadA, 0, bytes);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_commandList->ResourceBarrier(1, &barrier);
+
+    CloseExecuteResetWait();
+    g_gemmH2DMs += nowMs() - t0;
+    return 0;
+}
+
+int dml_tensor_readback(uint64_t handle, void* data, uint32_t bytes) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (handle >= g_tensors.size()) return -3;
+    TensorEntry& t = g_tensors[handle];
+    if (!t.in_use) return -3;
+    if (t.bytes < bytes) return -4;
+
+    double t0 = nowMs();
+
+    ensureBuffer(g_readbackC, g_readbackCSize, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = t.resource;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_commandList->ResourceBarrier(1, &barrier);
+
+    g_commandList->CopyResource(g_readbackC, t.resource);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g_commandList->ResourceBarrier(1, &barrier);
+
+    CloseExecuteResetWait();
+
+    D3D12_RANGE range = { 0, bytes };
+    void* mapped = nullptr;
+    g_readbackC->Map(0, &range, &mapped);
+    memcpy(data, mapped, bytes);
+    g_readbackC->Unmap(0, nullptr);
+    g_gemmD2HMs += nowMs() - t0;
+    return 0;
+}
+
+// ── Stage 1: handle-based GEMM（裝置常駐，支援 dtype）──
+// 註：目前 DirectML 版本無 DML_OPERATOR_ACTIVATION_SILU，fused_activation 僅接受 0；
+//     silu 由 Python 端以 sigmoid + elementwise_mul 分解（全裝置端，零 CPU 往返）。
+int dml_gemm(uint64_t a, uint64_t b, uint64_t c, uint32_t M, uint32_t K, uint32_t N,
+             uint32_t dtype, int fused_activation) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (fused_activation != 0) return -6;
+    if (a >= g_tensors.size() || b >= g_tensors.size() || c >= g_tensors.size()) return -3;
+    TensorEntry& ta = g_tensors[a];
+    TensorEntry& tb = g_tensors[b];
+    TensorEntry& tc = g_tensors[c];
+    if (!ta.in_use || !tb.in_use || !tc.in_use) return -3;
+
+    size_t elemSize = dtypeSize(dtype);
+    size_t aBytes = (size_t)M * K * elemSize;
+    size_t bBytes = (size_t)K * N * elemSize;
+    size_t cBytes = (size_t)M * N * elemSize;
+    if (ta.bytes < aBytes || tb.bytes < bBytes || tc.bytes < cBytes) return -4;
+
+    double t0 = nowMs();
+
+    auto shapeKey = std::make_tuple(M, K, N, dtype, fused_activation);
+    auto it = g_handleOpCache.find(shapeKey);
+    if (it == g_handleOpCache.end()) {
+        uint32_t aSizes[] = { 1, 1, M, K };
+        uint32_t bSizes[] = { 1, 1, K, N };
+        uint32_t cSizes[] = { 1, 1, M, N };
+
+        DML_BUFFER_TENSOR_DESC aTensorBufferDesc = {};
+        aTensorBufferDesc.DataType = dmlDtype(dtype);
+        aTensorBufferDesc.Flags = DML_TENSOR_FLAG_NONE;
+        aTensorBufferDesc.DimensionCount = 4;
+        aTensorBufferDesc.Sizes = aSizes;
+        aTensorBufferDesc.TotalTensorSizeInBytes = aBytes;
+        DML_TENSOR_DESC aTensorDesc = { DML_TENSOR_TYPE_BUFFER, &aTensorBufferDesc };
+
+        DML_BUFFER_TENSOR_DESC bTensorBufferDesc = {};
+        bTensorBufferDesc.DataType = dmlDtype(dtype);
+        bTensorBufferDesc.Flags = DML_TENSOR_FLAG_NONE;
+        bTensorBufferDesc.DimensionCount = 4;
+        bTensorBufferDesc.Sizes = bSizes;
+        bTensorBufferDesc.TotalTensorSizeInBytes = bBytes;
+        DML_TENSOR_DESC bTensorDesc = { DML_TENSOR_TYPE_BUFFER, &bTensorBufferDesc };
+
+DML_BUFFER_TENSOR_DESC cTensorBufferDesc = {};
+        cTensorBufferDesc.DataType = dmlDtype(dtype);
+        cTensorBufferDesc.Flags = DML_TENSOR_FLAG_NONE;
+        cTensorBufferDesc.DimensionCount = 4;
+        cTensorBufferDesc.Sizes = cSizes;
+        cTensorBufferDesc.TotalTensorSizeInBytes = cBytes;
+        DML_TENSOR_DESC cTensorDesc = { DML_TENSOR_TYPE_BUFFER, &cTensorBufferDesc };
+
+        DML_GEMM_OPERATOR_DESC gemmDesc = {};
+        gemmDesc.ATensor = &aTensorDesc;
+        gemmDesc.BTensor = &bTensorDesc;
+        gemmDesc.CTensor = nullptr;
+        gemmDesc.OutputTensor = &cTensorDesc;
+        gemmDesc.TransA = DML_MATRIX_TRANSFORM_NONE;
+        gemmDesc.TransB = DML_MATRIX_TRANSFORM_NONE;
+        gemmDesc.Alpha = 1.0f;
+        gemmDesc.Beta = 0.0f;
+        gemmDesc.FusedActivation = nullptr;
+
+        DML_OPERATOR_DESC opDesc = { DML_OPERATOR_GEMM, &gemmDesc };
+        CachedOp cached = compileOperator(&opDesc);
+        if (!cached.compiledOp) return -5;
+        g_handleOpCache[shapeKey] = cached;
+        it = g_handleOpCache.find(shapeKey);
+    }
+
+    CachedOp& op = it->second;
+
+    DML_BUFFER_BINDING aBinding = { ta.resource, 0, aBytes };
+    DML_BUFFER_BINDING bBinding = { tb.resource, 0, bBytes };
+    DML_BUFFER_BINDING cBinding = { tc.resource, 0, cBytes };
+    DML_BINDING_DESC inputDescs[] = {
+        { DML_BINDING_TYPE_BUFFER, &aBinding },
+        { DML_BINDING_TYPE_BUFFER, &bBinding },
+        { DML_BINDING_TYPE_NONE, nullptr }
+    };
+    DML_BINDING_DESC outputDesc = { DML_BINDING_TYPE_BUFFER, &cBinding };
+    dispatchOperator(op, inputDescs, 3, &outputDesc);
+
+    g_gemmCount++;
+    g_gemmDispatchMs += nowMs() - t0;
+    return 0;
+}
+
+// ── Stage 1: 裝置端 elementwise multiply（SwiGLU 的 silu(x)*y 融合）──
+int dml_elementwise_mul(uint64_t a, uint64_t b, uint64_t c, uint32_t count, uint32_t dtype) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (a >= g_tensors.size() || b >= g_tensors.size() || c >= g_tensors.size()) return -3;
+    TensorEntry& ta = g_tensors[a];
+    TensorEntry& tb = g_tensors[b];
+    TensorEntry& tc = g_tensors[c];
+    if (!ta.in_use || !tb.in_use || !tc.in_use) return -3;
+
+    size_t elemSize = dtypeSize(dtype);
+    size_t bytes = (size_t)count * elemSize;
+    if (ta.bytes < bytes || tb.bytes < bytes || tc.bytes < bytes) return -4;
+
+    double t0 = nowMs();
+
+    auto shapeKey = std::make_tuple(count, dtype);
+    auto it = g_mulCache.find(shapeKey);
+    if (it == g_mulCache.end()) {
+        uint32_t sizes[] = { 1, 1, 1, count };
+
+        DML_BUFFER_TENSOR_DESC aTensorBufferDesc = {};
+        aTensorBufferDesc.DataType = dmlDtype(dtype);
+        aTensorBufferDesc.Flags = DML_TENSOR_FLAG_NONE;
+        aTensorBufferDesc.DimensionCount = 4;
+        aTensorBufferDesc.Sizes = sizes;
+        aTensorBufferDesc.TotalTensorSizeInBytes = bytes;
+        DML_TENSOR_DESC aTensorDesc = { DML_TENSOR_TYPE_BUFFER, &aTensorBufferDesc };
+
+        DML_BUFFER_TENSOR_DESC bTensorBufferDesc = aTensorBufferDesc;
+        DML_TENSOR_DESC bTensorDesc = { DML_TENSOR_TYPE_BUFFER, &bTensorBufferDesc };
+
+        DML_BUFFER_TENSOR_DESC cTensorBufferDesc = aTensorBufferDesc;
+        DML_TENSOR_DESC cTensorDesc = { DML_TENSOR_TYPE_BUFFER, &cTensorBufferDesc };
+
+        DML_ELEMENT_WISE_MULTIPLY_OPERATOR_DESC mulDesc = {};
+        mulDesc.ATensor = &aTensorDesc;
+        mulDesc.BTensor = &bTensorDesc;
+        mulDesc.OutputTensor = &cTensorDesc;
+
+        DML_OPERATOR_DESC opDesc = { DML_OPERATOR_ELEMENT_WISE_MULTIPLY, &mulDesc };
+        CachedOp cached = compileOperator(&opDesc);
+        if (!cached.compiledOp) return -5;
+        g_mulCache[shapeKey] = cached;
+        it = g_mulCache.find(shapeKey);
+    }
+
+    CachedOp& op = it->second;
+
+    DML_BUFFER_BINDING aBinding = { ta.resource, 0, bytes };
+    DML_BUFFER_BINDING bBinding = { tb.resource, 0, bytes };
+    DML_BUFFER_BINDING cBinding = { tc.resource, 0, bytes };
+    DML_BINDING_DESC inputDescs[] = {
+        { DML_BINDING_TYPE_BUFFER, &aBinding },
+        { DML_BINDING_TYPE_BUFFER, &bBinding }
+    };
+    DML_BINDING_DESC outputDesc = { DML_BINDING_TYPE_BUFFER, &cBinding };
+    dispatchOperator(op, inputDescs, 2, &outputDesc);
+
+    g_gemmCount++;
+    g_gemmDispatchMs += nowMs() - t0;
+    return 0;
+}
+
+// ── Stage 1: 裝置端 sigmoid（silu(x) = x * sigmoid(x) 分解用）──
+int dml_activation_sigmoid(uint64_t a, uint64_t c, uint32_t count, uint32_t dtype) {
+    if (!g_initialized) {
+        if (dml_gemm_init() != 0) return -1;
+    }
+    if (a >= g_tensors.size() || c >= g_tensors.size()) return -3;
+    TensorEntry& ta = g_tensors[a];
+    TensorEntry& tc = g_tensors[c];
+    if (!ta.in_use || !tc.in_use) return -3;
+
+    size_t elemSize = dtypeSize(dtype);
+    size_t bytes = (size_t)count * elemSize;
+    if (ta.bytes < bytes || tc.bytes < bytes) return -4;
+
+    double t0 = nowMs();
+
+    auto shapeKey = std::make_tuple(count, dtype);
+    auto it = g_sigmoidCache.find(shapeKey);
+    if (it == g_sigmoidCache.end()) {
+        uint32_t sizes[] = { 1, 1, 1, count };
+
+        DML_BUFFER_TENSOR_DESC aTensorBufferDesc = {};
+        aTensorBufferDesc.DataType = dmlDtype(dtype);
+        aTensorBufferDesc.Flags = DML_TENSOR_FLAG_NONE;
+        aTensorBufferDesc.DimensionCount = 4;
+        aTensorBufferDesc.Sizes = sizes;
+        aTensorBufferDesc.TotalTensorSizeInBytes = bytes;
+        DML_TENSOR_DESC aTensorDesc = { DML_TENSOR_TYPE_BUFFER, &aTensorBufferDesc };
+
+        DML_BUFFER_TENSOR_DESC cTensorBufferDesc = aTensorBufferDesc;
+        DML_TENSOR_DESC cTensorDesc = { DML_TENSOR_TYPE_BUFFER, &cTensorBufferDesc };
+
+        DML_ACTIVATION_SIGMOID_OPERATOR_DESC sigDesc = {};
+        sigDesc.InputTensor = &aTensorDesc;
+        sigDesc.OutputTensor = &cTensorDesc;
+
+        DML_OPERATOR_DESC opDesc = { DML_OPERATOR_ACTIVATION_SIGMOID, &sigDesc };
+        CachedOp cached = compileOperator(&opDesc);
+        if (!cached.compiledOp) return -5;
+        g_sigmoidCache[shapeKey] = cached;
+        it = g_sigmoidCache.find(shapeKey);
+    }
+
+    CachedOp& op = it->second;
+
+    DML_BUFFER_BINDING aBinding = { ta.resource, 0, bytes };
+    DML_BUFFER_BINDING cBinding = { tc.resource, 0, bytes };
+    DML_BINDING_DESC inputDescs[] = {
+        { DML_BINDING_TYPE_BUFFER, &aBinding }
+    };
+    DML_BINDING_DESC outputDesc = { DML_BINDING_TYPE_BUFFER, &cBinding };
+    dispatchOperator(op, inputDescs, 1, &outputDesc);
+
+    g_gemmCount++;
+    g_gemmDispatchMs += nowMs() - t0;
     return 0;
 }
 
 void dml_gemm_shutdown() {
+    // ── Stage 0: dump 剖析統計 ──
+    if (g_gemmCount > 0) {
+        fprintf(stderr,
+                "[dml_gemm] stats: count=%llu | H2D=%.2fms | dispatch=%.2fms | D2H=%.2fms | fence=%.2fms | total=%.2fms\n",
+                (unsigned long long)g_gemmCount, g_gemmH2DMs, g_gemmDispatchMs, g_gemmD2HMs, g_gemmFenceMs,
+                g_gemmH2DMs + g_gemmDispatchMs + g_gemmD2HMs + g_gemmFenceMs);
+    }
+
     for (auto& pair : g_opCache) {
         pair.second.bindingTable->Release();
         pair.second.descriptorHeap->Release();
         pair.second.compiledOp->Release();
     }
     g_opCache.clear();
+
+    for (auto& pair : g_handleOpCache) {
+        pair.second.bindingTable->Release();
+        pair.second.descriptorHeap->Release();
+        pair.second.compiledOp->Release();
+    }
+    g_handleOpCache.clear();
+
+for (auto& pair : g_mulCache) {
+        pair.second.bindingTable->Release();
+        pair.second.descriptorHeap->Release();
+        pair.second.compiledOp->Release();
+    }
+    g_mulCache.clear();
+
+    for (auto& pair : g_sigmoidCache) {
+        pair.second.bindingTable->Release();
+        pair.second.descriptorHeap->Release();
+        pair.second.compiledOp->Release();
+    }
+    g_sigmoidCache.clear();
+
+    for (auto& t : g_tensors) {
+        if (t.resource) t.resource->Release();
+    }
+    g_tensors.clear();
+    g_freeTensorIds.clear();
 
     if (g_uploadA) g_uploadA->Release();
     if (g_inputA) g_inputA->Release();

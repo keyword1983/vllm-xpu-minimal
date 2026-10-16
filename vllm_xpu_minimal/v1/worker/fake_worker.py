@@ -29,6 +29,21 @@ class XPUFakeWorker(CPUWorker):
     """Fake XPU Worker 實作（繼承 CPUWorker，以 CPU 模擬硬體接入）。"""
 
     def __init__(self, *args, **kwargs):
+        # 坑 16：vLLM 0.31.0 CPUWorker.__init__ 呼叫 torch.ops._C.init_cpu_memory_env
+        # （cpu_worker.py:70）。無 CUDA 環境下 vllm._C 無法載入（缺 libcuda.so.1），
+        # torch.ops._C 為空 namespace → AttributeError → 整個自訂 Worker 初始化中斷，
+        # 導致 XPUFakeModelRunner 不被替換、MLP 融合 patch 不掛載。
+        # 解法：若 _C 缺該符號，setattr 一個 no-op（CPU 記憶體綁定對本插件無意義）。
+        try:
+            if not hasattr(torch.ops._C, "init_cpu_memory_env"):
+                torch.ops._C.init_cpu_memory_env = lambda *a, **k: None
+                logger.info(
+                    "[XPUFakeWorker] Patched torch.ops._C.init_cpu_memory_env "
+                    "with no-op (vllm._C unavailable)."
+                )
+        except Exception as e:
+            logger.debug("[XPUFakeWorker] init_cpu_memory_env patch note: %s", e)
+
         # 嘗試以 CPUWorker 初始化；若處於特殊環境（如無 NUMA C++ 擴展），提供平滑容錯
         try:
             super().__init__(*args, **kwargs)

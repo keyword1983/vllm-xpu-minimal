@@ -272,6 +272,24 @@ def _patch_linear_for_directml() -> None:
             N, K = layer.weight.size()
             dtype = layer.weight.dtype
 
+            # ★ Phase 7 Stage 1: MLP 融合權重 stash（在權重被 remove 前擷取）
+            try:
+                from vllm.model_executor.layers.linear import (
+                    MergedColumnParallelLinear, RowParallelLinear)
+                if isinstance(layer, MergedColumnParallelLinear) and len(layer.output_sizes) == 2:
+                    # gate_up_proj: [2*I, H] → gate [H, I] + up [H, I]（轉置後）
+                    w_fp32 = layer.weight.data.to(torch.float32)
+                    i = layer.output_sizes[0]
+                    layer._dml_gate_fp32 = w_fp32[:i].t().contiguous()
+                    layer._dml_up_fp32 = w_fp32[i:].t().contiguous()
+                    logger.info(
+                        f"✓ [MLP Fusion] gate_up_proj 權重已 stash (H={K}, I={i})")
+                elif isinstance(layer, RowParallelLinear):
+                    # down_proj（o_proj 也會 stash，但融合路徑不使用，無害）
+                    layer._dml_w_fp32 = layer.weight.data.to(torch.float32).t().contiguous()
+            except Exception as e:
+                logger.debug(f"[MLP Fusion] 權重 stash 失敗（不影響 per-linear 路徑）: {e}")
+
             # 預先將 weight 轉置並轉換為 float32，保證推論時零額外轉型與轉置開銷
             wt_fp32_t = layer.weight.data.to(torch.float32).t().contiguous()
 
@@ -325,6 +343,11 @@ _patch_block_table_for_cpu()
 _patch_rotary_embedding_for_cpu()
 _patch_sampler_for_cpu()
 _patch_linear_for_directml()
+try:
+    from vllm_xpu_minimal.device.mlp_fusion import patch_qwen2_mlp
+    patch_qwen2_mlp()
+except Exception as e:
+    logger.warning(f"[MLP Fusion] patch 掛載失敗: {e}")
 try:
     from vllm_xpu_minimal.v1.attention.fake_attention import _register_cpu_cache_ops
     _register_cpu_cache_ops()
